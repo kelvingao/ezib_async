@@ -1,11 +1,12 @@
 # ezIBpy_async.py
 from .connection import ConnectionManager
+from .contracts import ContractManager
 
 class ezIBAsync:
     def __init__(self):
         self._conn = ConnectionManager()
         self._contracts = ContractManager(self._conn)
-        self._orders = OrderManager(self._conn, self._contracts)
+        # self._orders = OrderManager(self._conn, self._contracts)
         
     async def connect(
         self, host: str = '127.0.0.1', port: int = 4002, client_id: int = 1) -> None:
@@ -40,6 +41,6 @@ class ezIBAsync:
     def contracts(self):
         return self._contracts
     
-    @property
-    def orders(self):
-        return self._orders
+    # @property
+    # def orders(self):
+    #     return self._orders
