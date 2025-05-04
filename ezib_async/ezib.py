@@ -45,6 +45,7 @@ class ezIBAsync:
         # Initialize the IB client directly
         self.ib = IB()
         self.isConnected = False
+        self._disconnected_by_user = False
 
         self._register_events_handlers()
 
@@ -78,6 +79,7 @@ class ezIBAsync:
             # Update connection state
             self.isConnected = self.ib.isConnected()
             self._logger.info("Connected to IB successfully")
+            self._disconnected_by_user = False
             return True
                 
         except Exception as e:
@@ -92,7 +94,7 @@ class ezIBAsync:
         
         """
         if self.ib is not None:
-            # Register our disconnection handler
+            # Register disconnection handler
             self.ib.disconnectedEvent += self._on_disconnected
             self._logger.debug("Disconnection Event handler registered")
 
@@ -102,18 +104,19 @@ class ezIBAsync:
         Disconnection event handler for Interactive Brokers TWS/Gateway.
         
         """
-        self._logger.warning("Disconnected from IB")
         self.isConnected = False
 
-        asyncio.create_task(self._reconnect())
+        if not self._disconnected_by_user:
+            self._logger.warning("Disconnected from IB")
+            asyncio.create_task(self._reconnect())
 
-    async def _reconnect(self, reconnect_interval = 3, max_attempts=100):
+    async def _reconnect(self, reconnect_interval = 2, max_attempts=300):
         """
         Reconnects to Interactive Brokers TWS/Gateway after a disconnection.
         
         """
         attempt = 0
-        while not self.isConnected and attempt < max_attempts:
+        while not self.isConnected and attempt < max_attempts and not self._disconnected_by_user:
             attempt += 1
             self._logger.info(f"Reconnection attempt {attempt}/{max_attempts}...")
             
@@ -136,7 +139,8 @@ class ezIBAsync:
         Disconnects from the Interactive Brokers API (TWS/Gateway) and cleans up resources.
 
         """
+        self._disconnected_by_user = True
         if self.isConnected:
-            self._logger.info("Disconnecting from ezIBAsync")
+            self._logger.info("Disconnecting from IB")
             self.ib.disconnect()
             self.isConnected = False
