@@ -40,6 +40,8 @@ class ezIBAsync:
         self._ibclient = ibclient
         self._default_account = account
 
+        # Accounts
+        self._accounts = {}  # account_id -> account_values
         self._logger = logging.getLogger('ezib_async.ezib')
 
         # Initialize the IB client directly
@@ -62,9 +64,9 @@ class ezIBAsync:
             account (str, optional): Default account to use
         """
         # Use provided parameters or fall back to stored values
-        self._ibhost = ibhost or self._ibhost
-        self._ibport = ibport or self._ibport
-        self._ibclient = ibclient or self._ibclient
+        self._ibhost = ibhost if ibhost is not None else self._ibhost
+        self._ibport = ibport if ibport is not None else self._ibport
+        self._ibclient = ibclient if ibclient is not None else self._ibclient
         
         # Update default account if provided
         if account is not None:
@@ -96,7 +98,54 @@ class ezIBAsync:
         if self.ib is not None:
             # Register disconnection handler
             self.ib.disconnectedEvent += self._on_disconnected
-            self._logger.debug("Disconnection Event handler registered")
+            self._logger.debug("disconnnectedEvent handler registered")
+
+            # Account value event
+            self.ib.accountValueEvent += self._on_account_value
+            self._logger.debug("accountValueEvent handler registered")
+
+            # Account summary event
+            # self.ib.accountSummaryEvent += self._on_account_summary
+            # self._logger.debug("accountSummaryEvent handler registered")
+
+    # ---------------------------------------
+    def _on_account_value(self, value):
+        """
+        Handle account value updates from IB.
+        
+        Args:
+            value: AccountValue object from IB
+        """
+        try:        
+            # Create account entry if it doesn't exist
+            if value.account not in self._accounts:
+                self._accounts[value.account] = {}
+                
+            # Set value
+            self._accounts[value.account][value.tag] = value.value
+            self._logger.debug(f"Account value update: {value.account} - {value.tag}: {value.value}")
+            
+        except Exception as e:
+            self._logger.error(f"Error handling account value update: {e}")
+
+    def _on_account_summary(self, summary):
+        """
+        Handle account summary updates from IB.
+        
+        Args:
+            summary: AccountSummary object from IB
+        """
+        try:         
+            # Create account entry if it doesn't exist
+            if summary.account not in self._accounts:
+                self._accounts[summary.account] = {}
+                
+            # Set value
+            self._accounts[summary.account][summary.tag] = value
+            self._logger.debug(f"Account summary update: {summary.account} - {summary.tag}: {summary.value}")
+            
+        except Exception as e:
+            self._logger.error(f"Error handling account summary update: {e}")
 
     # ---------------------------------------
     def _on_disconnected(self):
@@ -144,3 +193,13 @@ class ezIBAsync:
             self._logger.info("Disconnecting from IB")
             self.ib.disconnect()
             self.isConnected = False
+    
+
+    # ---------------------------------------
+    @property
+    def accounts(self):
+        """
+        Get all account information.
+        
+        """
+        return self._accounts
