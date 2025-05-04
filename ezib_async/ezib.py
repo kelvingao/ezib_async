@@ -10,12 +10,10 @@ import sys
 import logging
 
 from ib_async import IB
-from ezib_async import util
 
 # Check Python version
 if sys.version_info < (3, 11):
     raise SystemError("ezIBAsync requires Python version >= 3.11")
-
 
 class ezIBAsync:
     """
@@ -46,8 +44,10 @@ class ezIBAsync:
 
         # Initialize the IB client directly
         self.ib = IB()
-        self.connected = False
-        
+        self.isConnected = False
+
+        self._register_events_handlers()
+
     # ---------------------------------------
     async def connectAsync(self, ibhost=None, ibport=None, 
                           ibclient=None, account=None):
@@ -61,44 +61,82 @@ class ezIBAsync:
             account (str, optional): Default account to use
         """
         # Use provided parameters or fall back to stored values
-        ibhost = ibhost or self._ibhost
-        ibport = ibport or self._ibport
-        ibclient = ibclient or self._ibclient
+        self._ibhost = ibhost or self._ibhost
+        self._ibport = ibport or self._ibport
+        self._ibclient = ibclient or self._ibclient
         
         # Update default account if provided
         if account is not None:
             self._default_account = account
             self._logger.info(f"Default account set to {account}")
         
-        # Log connection attempt
-        self._logger.info(f"Connecting to IB at {ibhost}:{ibport} (client ID: {ibclient})")
-        
         try:
             # Connect using the IB client
-            await self.ib.connectAsync(host=ibhost, port=ibport, clientId=ibclient)
+            self._logger.info(f"Connecting to IB at {self._ibhost}:{self._ibport} (client ID: {self._ibclient})")
+            await self.ib.connectAsync(host=self._ibhost, port=self._ibport, clientId=self._ibclient)
             
             # Update connection state
-            self.connected = self.ib.isConnected()
+            self.isConnected = self.ib.isConnected()
             self._logger.info("Connected to IB successfully")
             return True
                 
         except Exception as e:
             self._logger.error(f"Error connecting to IB: {e}")
-            self.connected = False
+            self.isConnected = False
             return False
+
+    # ---------------------------------------
+    def _register_events_handlers(self):
+        """
+        Registers event handlers for the Interactive Brokers TWS/Gateway connection.
+        
+        """
+        if self.ib is not None:
+            # Register our disconnection handler
+            self.ib.disconnectedEvent += self._on_disconnected
+            self._logger.debug("Disconnection Event handler registered")
+
+    # ---------------------------------------
+    def _on_disconnected(self):
+        """
+        Disconnection event handler for Interactive Brokers TWS/Gateway.
+        
+        """
+        self._logger.warning("Disconnected from IB")
+        self.isConnected = False
+
+        asyncio.create_task(self._reconnect())
+
+    async def _reconnect(self, reconnect_interval = 3, max_attempts=100):
+        """
+        Reconnects to Interactive Brokers TWS/Gateway after a disconnection.
+        
+        """
+        attempt = 0
+        while not self.isConnected and attempt < max_attempts:
+            attempt += 1
+            self._logger.info(f"Reconnection attempt {attempt}/{max_attempts}...")
+            
+            try:
+                await asyncio.sleep(reconnect_interval)
+                await self.connectAsync(ibhost=self._ibhost, ibport=self._ibport, ibclient=self._ibclient)
+                
+                if self.isConnected:
+                    self._logger.info("Reconnection successful")
+                    break
+            except Exception as e:
+                self._logger.error(f"Reconnection failed: {e}")
+                
+        if not self.isConnected and attempt >= max_attempts:
+            self._logger.error(f"Failed to reconnect after {max_attempts} attempts, giving up")
 
     # ---------------------------------------
     def disconnect(self):
         """
-        Synchronous disconnect method.
+        Disconnects from the Interactive Brokers API (TWS/Gateway) and cleans up resources.
+
         """
-        if self.ib.isConnected():
+        if self.isConnected:
             self._logger.info("Disconnecting from ezIBAsync")
             self.ib.disconnect()
-            self.connected = False
-
-if __name__ == "__main__":
-    util.logToConsole(logging.INFO)
-    logging.getLogger("ib_async").setLevel(logging.WARNING)
-    ezib = ezIBAsync()
-    asyncio.run(ezib.connectAsync())
+            self.isConnected = False
