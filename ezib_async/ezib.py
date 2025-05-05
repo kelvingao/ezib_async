@@ -67,11 +67,7 @@ class ezIBAsync:
         self._ibhost = ibhost if ibhost is not None else self._ibhost
         self._ibport = ibport if ibport is not None else self._ibport
         self._ibclient = ibclient if ibclient is not None else self._ibclient
-        
-        # Update default account if provided
-        if account is not None:
-            self._default_account = account
-            self._logger.info(f"Default account set to {account}")
+        self._default_account = account if account is not None else self._default_account
         
         try:
             # Connect using the IB client
@@ -82,6 +78,17 @@ class ezIBAsync:
             self.isConnected = self.ib.isConnected()
             self._logger.info("Connected to IB successfully")
             self._disconnected_by_user = False
+
+            # Validate default account
+            if self._default_account is not None:
+                if self._default_account not in self.accountCodes:
+                    self._logger.warning(f"Default account {self._default_account} not found in available accounts: {self.accountCodes}")
+                    # Switch to first available account
+                    self._default_account = self.accountCodes[0]
+                    self._logger.warning(f"Switched default account to {self._default_account}")
+            else:
+                self._default_account = self.accountCodes[0]
+
             return True
                 
         except Exception as e:
@@ -193,7 +200,41 @@ class ezIBAsync:
             self._logger.info("Disconnecting from IB")
             self.ib.disconnect()
             self.isConnected = False
-    
+
+    # ---------------------------------------
+    def getAccount(self, account=None):
+        if len(self._accounts) == 0:
+            return {}
+
+        account = self._get_active_account(account)
+
+        if account is None:
+            if len(self._accounts) > 1:
+                raise ValueError("Must specify account number as multiple accounts exists.")
+            return self._accounts[self._default_account]
+
+        if account in self._accounts:
+            return self._accounts[account]
+
+        raise ValueError("Account %s not found in account list" % account)
+
+    # ---------------------------------------
+    def _get_active_account(self, account = None):
+        """
+        Get the active account to use.
+
+        """
+        if account is None:
+            return self._default_account
+
+        elif account in self.accountCodes:
+            return account
+
+        if len(self._accounts) > 1:
+            raise ValueError("Must specify account number as multiple accounts exists.")
+            # return self._accounts[list(self._accounts.keys())[0]]
+        
+        return None
 
     # ---------------------------------------
     @property
@@ -203,3 +244,18 @@ class ezIBAsync:
         
         """
         return self._accounts
+
+    @property
+    def account(self):
+        """
+        Get information for the default account.
+        
+        Returns:
+            Dictionary of account information
+
+        """
+        return self.getAccount()
+    
+    @property
+    def accountCodes(self):
+        return list(self._accounts.keys())
