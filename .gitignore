@@ -43,8 +43,6 @@ coverage.xml
 .DS_Store
 
 # Project specific
+.windsurfrules
 *.log
 logs/
-tests/
-PLANNING.md
-TASKS.md

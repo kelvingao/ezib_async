@@ -9,7 +9,7 @@ import asyncio
 import sys
 import logging
 
-from ib_async import IB
+from ib_async import IB, Contract, ComboLeg
 
 # Check Python version
 if sys.version_info < (3, 11):
@@ -39,9 +39,18 @@ class ezIBAsync:
         self._ibport = ibport
         self._ibclient = ibclient
         self._default_account = account
+        
+        # auto-construct for every contract/order
+        self.tickerIds     = {0: "SYMBOL"}
+        self.contracts     = {}
+        self._contract_details = {}  # multiple expiry/strike/side contracts
+        self.contract_details  = {}
+        self.localSymbolExpiry = {}
 
         # Accounts
-        self._accounts = {}  # account_id -> account_values
+        self._accounts  = {}  # account_id -> account_values
+        self._portfolio = {}  # account_id -> symbol -> portfolio_item
+
         self._logger = logging.getLogger('ezib_async.ezib')
 
         # Initialize the IB client directly
@@ -235,6 +244,696 @@ class ezIBAsync:
             # return self._accounts[list(self._accounts.keys())[0]]
         
         return None
+
+    # =============================================
+    # Contracts Managment
+    # =============================================
+
+
+    # -----------------------------------------
+    # tickerId/Symbols constructors
+    # -----------------------------------------
+    def tickerId(self, contract_identifier):
+        """
+        Get the ticker ID for a contract or symbol.
+        
+        If the contract or symbol doesn't have a ticker ID yet, a new one is assigned.
+        
+        Args:
+            contract_identifier: Contract object or symbol string
+        """
+        # Handle contract object
+        symbol = contract_identifier
+        if isinstance(symbol, Contract):
+            symbol = self.contractString(symbol)
+            
+        # Check if symbol already has a ticker ID
+        for tickerId, tickerSymbol in self.tickerIds.items():
+            if symbol == tickerSymbol:
+                return tickerId
+                
+        # Assign new ticker ID
+        tickerId = len(self.tickerIds)
+        self.tickerIds[tickerId] = symbol
+        return tickerId
+        
+    def tickerSymbol(self, tickerId):
+        """
+        Get the symbol for a ticker ID.
+
+        """
+        try:
+            return self.tickerIds[tickerId]
+        except KeyError:
+            return ""
+
+    # ---------------------------------------
+    @staticmethod
+    def contract_to_tuple(contract):
+        """
+        Convert a contract object to a tuple representation.
+        
+        Args:
+            contract: Contract object
+        """
+        return (
+            contract.symbol,
+            contract.secType,
+            contract.exchange,
+            contract.currency,
+            contract.lastTradeDateOrContractMonth,
+            contract.strike,
+            contract.right
+        )
+
+    def contractString(self, contract, separator = "_"):
+        """
+        Convert a contract object or tuple to a string representation.
+        
+        Args:
+            contract: Contract object or tuple
+            separator: Separator to use between contract elements
+            
+        Returns:
+            String representation of the contract
+        """
+        contractTuple = contract
+        
+        if not isinstance(contract, tuple):
+            contractTuple = self.contract_to_tuple(contract)
+            
+        try:
+            if contractTuple[1] in ("OPT", "FOP"):
+                # Format strike price for options
+                strike = '{:0>5d}'.format(int(contractTuple[5])) + \
+                    format(contractTuple[5], '.3f').split('.')[1]
+                    
+                contractString = (contractTuple[0] + str(contractTuple[4]) +
+                                  contractTuple[6][0] + strike, contractTuple[1])
+                                  
+            elif contractTuple[1] == "FUT":
+                # Format expiry for futures
+                exp = str(contractTuple[4])[:6]
+                month_codes = {
+                    1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
+                    7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'
+                }
+                exp = month_codes[int(exp[4:6])] + exp[:4]
+                contractString = (contractTuple[0] + exp, contractTuple[1])
+                
+            elif contractTuple[1] == "CASH":
+                contractString = (contractTuple[0] + contractTuple[3], contractTuple[1])
+                
+            else:  # STK
+                contractString = (contractTuple[0], contractTuple[1])
+                
+            # Construct string
+            contractString = separator.join(
+                str(v) for v in contractString).replace(separator + "STK", "")
+                
+        except Exception as e:
+            self._logger.error(f"Error converting contract to string: {e}")
+            contractString = contractTuple[0]
+            
+        return contractString.replace(" ", "_").upper()
+
+    # ---------------------------------------
+    def contractDetails(self, contract_identifier):
+        """
+        Get contract details for a contract, symbol, or ticker ID.
+        
+        Args:
+            contract_identifier: Contract object, symbol string, or ticker ID
+            
+        Returns:
+            Dictionary of contract details
+        """
+        if isinstance(contract_identifier, Contract):
+            tickerId = self.tickerId(contract_identifier)
+        else:
+            if isinstance(contract_identifier, int) or (
+                isinstance(contract_identifier, str) and contract_identifier.isdigit()
+            ):
+                tickerId = int(contract_identifier)
+            else:
+                tickerId = self.tickerId(contract_identifier)
+                
+        # Check if we have the contract details
+        if tickerId in self._contract_details:
+            return self._contract_details[tickerId]
+            
+        # Default values if no details are available
+        return {
+            'tickerId': 0,
+            'category': None, 
+            'contractMonth': '', 
+            'downloaded': False, 
+            'evMultiplier': 0,
+            'evRule': None, 
+            'industry': None, 
+            'liquidHours': '', 
+            'longName': '',
+            'marketName': '', 
+            'minTick': 0.01, 
+            'orderTypes': '', 
+            'priceMagnifier': 0,
+            'subcategory': None, 
+            'timeZoneId': '', 
+            'tradingHours': '', 
+            'underConId': 0,
+            'validExchanges': 'SMART', 
+            'contracts': [Contract()], 
+            'conId': 0,
+            'summary': {
+                'conId': 0, 
+                'currency': 'USD', 
+                'exchange': 'SMART', 
+                'lastTradeDateOrContractMonth': '',
+                'includeExpired': False, 
+                'localSymbol': '', 
+                'multiplier': '',
+                'primaryExch': None, 
+                'right': None, 
+                'secType': '',
+                'strike': 0.0, 
+                'symbol': '', 
+                'tradingClass': '',
+            }
+        }
+
+    # ---------------------------------------
+    async def createContract(self, contractTuple, **kwargs):
+        """
+        Create a contract from a tuple representation.
+        
+        Args:
+            contractTuple: Tuple representation of the contract
+            **kwargs: Additional contract parameters
+            
+        Returns:
+            Created contract object
+        """
+        contractString = self.contractString(contractTuple)
+        tickerId = self.tickerId(contractString)
+        
+        # Create a new Contract object
+        newContract = Contract()
+        newContract.symbol = contractTuple[0]
+        newContract.secType = contractTuple[1]
+        newContract.exchange = contractTuple[2] or "SMART"
+        newContract.currency = contractTuple[3] or "USD"
+        newContract.lastTradeDateOrContractMonth = contractTuple[4] or ""
+        newContract.strike = contractTuple[5] or 0.0
+        newContract.right = contractTuple[6] or ""
+        
+        if len(contractTuple) >= 8:
+            newContract.multiplier = contractTuple[7]
+            
+        # Include expired contracts for historical data
+        newContract.includeExpired = newContract.secType in ("FUT", "OPT", "FOP")
+        
+        # Add combo legs if provided
+        if "combo_legs" in kwargs:
+            newContract.comboLegs = kwargs["combo_legs"]
+            
+        # Add contract to pool
+        self.contracts[tickerId] = newContract
+        
+        # Request contract details if not a combo contract
+        if "combo_legs" not in kwargs:
+            try:
+                await self.requestContractDetails(newContract)
+                # await asyncio.sleep(1.5 if self.isMultiContract(newContract) else 0.5)
+            except KeyboardInterrupt:
+                self._logger.warning("Contract details request interrupted")
+                
+        return newContract
+
+    # ---------------------------------------
+    async def createStockContract(self, symbol, currency = "USD", exchange = "SMART"):
+        """
+        Create a stock contract.
+
+        """
+        contract_tuple = (symbol, "STK", exchange, currency, "", 0.0, "")
+        return await self.createContract(contract_tuple)
+    
+    # -----------------------------------------
+    async def createFuturesContract(self, symbol, currency = "USD", expiry = None, exchange = "GLOBEX", multiplier = ""):
+        """
+        Create a futures contract.
+        
+        Args:
+            symbol: Futures symbol
+            currency: Currency code
+            expiry: Expiry date(s) in YYYYMMDD format
+            exchange: Exchange code
+            multiplier: Contract multiplier
+
+        Returns:
+            Futures contract object or list of contracts
+        """
+        # Handle continuous futures
+        if symbol and symbol[0] == "@":
+            return await self.createContinuousFuturesContract(symbol[1:], exchange)
+            
+        # Handle multiple expiries
+        expiries = [expiry] if expiry and not isinstance(expiry, list) else expiry
+        
+        if not expiries:
+            contract_tuple = (symbol, "FUT", exchange, currency, "", 0.0, "", multiplier)
+            return await self.createContract(contract_tuple)
+            
+        contracts = []
+        for fut_expiry in expiries:
+            contract_tuple = (symbol, "FUT", exchange, currency, fut_expiry, 0.0, "", multiplier)
+            contract = await self.createContract(contract_tuple)
+            contracts.append(contract)
+            
+        return contracts[0] if len(contracts) == 1 else contracts
+
+    # -----------------------------------------
+    async def createContinuousFuturesContract(self, symbol, exchange = "GLOBEX",
+                                              output = "contract", is_retry = False):
+        """
+        Create a continuous futures contract.
+        
+        Args:
+            symbol: Futures symbol
+            exchange: Exchange code
+            output: Output type ('contract' or 'tuple')
+            is_retry: Whether this is a retry attempt
+            
+        Returns:
+            Futures contract object or tuple
+        """
+        # Create a continuous futures contract
+        contfut_contract = await self.createContract((symbol, "CONTFUT", exchange, "", "", "", ""))
+        
+        # Wait for contract details
+        for _ in range(25):
+            await asyncio.sleep(0.01)
+            contfut = self.contract_details(contfut_contract)
+            if contfut.get("tickerId", 0) != 0 and contfut.get("conId", 0) != 0:
+                break
+                
+        # Can't find contract? Retry once
+        if contfut.get("conId", 0) == 0:
+            if not is_retry:
+                return await self.createContinuousFuturesContract(symbol, exchange, output, True,)
+            raise ValueError(f"Can't find a valid Contract using this combination ({symbol}/{exchange})")
+            
+        # Get contract details
+        ticker_id = contfut.get("tickerId")
+        expiry = contfut.get("contractMonth", "")
+        currency = contfut.get("summary", {}).get("currency", "USD")
+        multiplier = contfut.get("summary", {}).get("multiplier", "")
+        
+        # Delete continuous placeholder
+        if ticker_id in self.contracts:
+            del self.contracts[ticker_id]
+        if ticker_id in self._contract_details:
+            del self._contract_details[ticker_id]
+            
+        # Return tuple or contract
+        if output == "tuple":
+            return (symbol, "FUT", exchange, currency, expiry, 0.0, "", multiplier)
+            
+        return await self.createFuturesContract(symbol, currency, expiry, exchange, multiplier)
+
+
+    # -----------------------------------------
+    async def createOptionContract(self, symbol, expiry = None, strike = 0.0, otype = "C",
+                                  currency = "USD", sec_type = "OPT", exchange = "SMART"):
+        """
+        Create an option contract.
+        
+        Args:
+            symbol: Underlying symbol
+            expiry: Expiry date(s) in YYYYMMDD format
+            strike: Strike price(s)
+            otype: Option type(s) ('C' for Call or 'P' for Put)
+            currency: Currency code
+            sec_type: Security type ('OPT' or 'FOP')
+            exchange: Exchange code
+            
+        Returns:
+            Option contract object or list of contracts
+        """
+        # Handle multiple parameters
+        expiries = [expiry] if expiry and not isinstance(expiry, list) else expiry
+        strikes = [strike] if not isinstance(strike, list) else strike
+        otypes = [otype] if not isinstance(otype, list) else otype
+        
+        contracts = []
+        for opt_expiry in expiries or [""]:
+            for opt_strike in strikes or [0.0]:
+                for opt_otype in otypes or ["C"]:
+                    contract_tuple = (symbol, sec_type, exchange, currency, opt_expiry, opt_strike, opt_otype)
+                    contract = await self.createContract(contract_tuple)
+                    contracts.append(contract)
+                    
+        return contracts[0] if len(contracts) == 1 else contracts
+        
+    async def createForexContract(self, symbol, currency = "USD", exchange = "IDEALPRO"):
+        """
+        Create a forex contract.
+        
+        Args:
+            symbol: Currency symbol (e.g., 'EUR' for EUR/USD)
+            currency: Quote currency
+            exchange: Exchange code
+            
+        Returns:
+            Forex contract object
+        """
+        contract_tuple = (symbol, "CASH", exchange, currency, "", 0.0, "")
+        return await self.createContract(contract_tuple)
+        
+    async def createIndexContract(self, symbol, currency = "USD", exchange = "CBOE"):
+        """
+        Create an index contract.
+        
+        Args:
+            symbol: Index symbol
+            currency: Currency code
+            exchange: Exchange code
+            
+        Returns:
+            Index contract object
+        """
+        contract_tuple = (symbol, "IND", exchange, currency, "", 0.0, "")
+        return await self.createContract(contract_tuple)
+        
+    async def createComboLeg(self, contract, action, ratio = 1, exchange = None):
+        """
+        Create a combo leg for a combo contract.
+        
+        Args:
+            contract: Contract for the leg
+            action: Action ('BUY' or 'SELL')
+            ratio: Leg ratio
+            exchange: Exchange code (defaults to contract's exchange)
+            
+        Returns:
+            ComboLeg object
+        """
+        leg = ComboLeg()
+        
+        # Get contract ID
+        loops = 0
+        con_id = 0
+        while con_id == 0 and loops < 100:
+            con_id = self.getConId(contract)
+            loops += 1
+            await asyncio.sleep(0.05)
+            
+        leg.conId = con_id
+        leg.ratio = abs(ratio)
+        leg.action = action
+        leg.exchange = contract.exchange if exchange is None else exchange
+        leg.openClose = 0
+        leg.shortSaleSlot = 0
+        leg.designatedLocation = ""
+        
+        return leg
+        
+    async def createComboContract(self, symbol, legs, currency = "USD", exchange = None):
+        """
+        Create a combo contract with multiple legs.
+        
+        Args:
+            symbol: Symbol for the combo
+            legs: List of ComboLeg objects
+            currency: Currency code
+            exchange: Exchange code (defaults to first leg's exchange)
+            
+        Returns:
+            Combo contract object
+        """
+        exchange = legs[0].exchange if exchange is None else exchange
+        contract_tuple = (symbol, "BAG", exchange, currency, "", 0.0, "")
+        return await self.createContract(contract_tuple, combo_legs=legs)
+
+    # ---------------------------------------
+    async def requestContractDetails(self, contract):
+        """
+        Request contract details from IB API.
+
+        """
+        tickerId = self.tickerId(contract)
+        try:
+            details = await self.ib.reqContractDetailsAsync(contract)
+            
+            if not details:
+                self._logger.warning(f"No contract details returned for {contract.symbol}")
+                return
+                
+            # Process contract details
+            await self._handle_contract_details(tickerId, details)
+            
+        except Exception as e:
+            self._logger.error(f"Error requesting contract details: {e}")
+
+    # -----------------------------------------
+    async def _handle_contract_details(self, tickerId, details):
+        """
+        Process contract details received from IB API.
+        
+        Args:
+            tickerId: Ticker ID for the contract
+            details: List of ContractDetails objects
+        """
+        if not details:
+            return
+            
+        # Create a dictionary to store contract details
+        details_dict = {
+            'tickerId': tickerId,
+            'downloaded': True,
+            'contracts': [detail.contract for detail in details],
+            'conId': details[0].contract.conId,
+            'contractMonth': details[0].contractMonth,
+            'industry': details[0].industry,
+            'category': details[0].category,
+            'subcategory': details[0].subcategory,
+            'timeZoneId': details[0].timeZoneId,
+            'tradingHours': details[0].tradingHours,
+            'liquidHours': details[0].liquidHours,
+            'evRule': details[0].evRule,
+            'evMultiplier': details[0].evMultiplier,
+            'minTick': details[0].minTick,
+            'orderTypes': details[0].orderTypes,
+            'validExchanges': details[0].validExchanges,
+            'priceMagnifier': details[0].priceMagnifier,
+            'underConId': details[0].underConId,
+            'longName': details[0].longName,
+            'marketName': details[0].marketName,
+        }
+        
+        # Add summary information
+        if len(details) > 1:
+            details_dict['contractMonth'] = ""
+            # Use closest expiration as summary
+            expirations = await self.getExpirations(self.contracts[tickerId])
+            if expirations:
+                contract = details_dict['contracts'][-len(expirations)]
+                details_dict['summary'] = vars(contract)
+            else:
+                details_dict['summary'] = vars(details_dict['contracts'][0])
+        else:
+            details_dict['summary'] = vars(details_dict['contracts'][0])
+            
+        # Store contract details
+        self._contract_details[tickerId] = details_dict
+        
+        # Add local symbol mapping
+        for detail in details:
+            contract = detail.contract
+            if contract.localSymbol and contract.localSymbol not in self.localSymbolExpiry:
+                self.localSymbolExpiry[contract.localSymbol] = detail.contractMonth
+                
+        # Add contracts to the contracts dictionary
+        for contract in details_dict['contracts']:
+            contract_string = self.contractString(contract)
+            contract_ticker_id = self.tickerId(contract_string)
+            self.contracts[contract_ticker_id] = contract
+            
+            # If this is a different ticker ID than the original, create a separate entry
+            if contract_ticker_id != tickerId:
+                contract_details = details_dict.copy()
+                contract_details['summary'] = vars(contract)
+                contract_details['contracts'] = [contract]
+                self._contract_details[contract_ticker_id] = contract_details
+
+    # -----------------------------------------
+    def getConId(self, contract_identifier):
+        """
+        Get the contract ID for a contract, symbol, or ticker ID.
+        
+        Args:
+            contract_identifier: Contract object, symbol string, or ticker ID
+            
+        Returns:
+            Contract ID
+        """
+        details = self.contractDetails(contract_identifier)
+        return details.get("conId", 0)
+
+    # -----------------------------------------
+    def isMultiContract(self, contract):
+        """
+        Check if a contract has multiple sub-contracts with different expiries/strikes/sides.
+        
+        """
+        # Futures with no expiry
+        if contract.secType == "FUT" and not contract.lastTradeDateOrContractMonth:
+            return True
+            
+        # Options with missing fields
+        if contract.secType in ("OPT", "FOP") and (
+            not contract.lastTradeDateOrContractMonth or 
+            not contract.strike or 
+            not contract.right
+        ):
+            return True
+            
+        # Check if we have multiple contracts in the details
+        tickerId = self.tickerId(contract)
+        if tickerId in self._contract_details and len(self._contract_details[tickerId]["contracts"]) > 1:
+            return True
+            
+        return False
+
+    # -----------------------------------------
+    async def getExpirations(self, contract_identifier, expired = 0):
+        """
+        Get available expirations for a contract.
+        
+        Args:
+            contract_identifier: Contract object, symbol string, or ticker ID
+            expired: Number of expired contracts to include (0 = none)
+            
+        Returns:
+            Tuple of expiration dates as integers (YYYYMMDD)
+        """
+        details = self.contractDetails(contract_identifier)
+        contracts = details.get("contracts", [])
+     
+        if not contracts or contracts[0].secType not in ("FUT", "FOP", "OPT"):
+            return tuple()
+            
+        # Collect expirations
+        expirations = []
+        for contract in contracts:
+            if contract.lastTradeDateOrContractMonth:
+                expirations.append(int(contract.lastTradeDateOrContractMonth))
+                
+        # Remove expired contracts
+        today = int(datetime.now().strftime("%Y%m%d"))
+        if expirations:
+            closest = min(expirations, key=lambda x: abs(x - today))
+            idx = expirations.index(closest) - expired
+            if idx >= 0:
+                expirations = expirations[idx:]
+            
+        return tuple(sorted(expirations))
+
+    # -----------------------------------------
+    async def getStrikes(self, contract_identifier, smin = None, smax = None):
+        """
+        Get available strikes for an option contract.
+        
+        Args:
+            contract_identifier: Contract object, symbol string, or ticker ID
+            smin: Minimum strike price
+            smax: Maximum strike price
+            
+        Returns:
+            Tuple of strike prices
+        """
+        details = self.contractDetails(contract_identifier)
+        contracts = details.get("contracts", [])
+        
+        if not contracts or contracts[0].secType not in ("FOP", "OPT"):
+            return tuple()
+            
+        # Collect strikes
+        strikes = []
+        for contract in contracts:
+            strikes.append(contract.strike)
+            
+        # Filter by min/max
+        if smin is not None or smax is not None:
+            smin = smin if smin is not None else 0
+            smax = smax if smax is not None else float('inf')
+            strikes = [s for s in strikes if smin <= s <= smax]
+            
+        return tuple(sorted(strikes))
+    
+    # -----------------------------------------
+    async def _register_contract(self, contract, account = None):
+        """
+        Register a contract that was received from a callback.
+        
+        Args:
+            contract: Contract object to register
+            account: Account to use, or None to use default
+        """
+        if contract.exchange == "":
+            return
+            
+        if self.getConId(contract, account) == 0:
+            contract_tuple = self.contract_to_tuple(contract)
+            await self.createContract(contract_tuple, account)
+
+    # -----------------------------------------
+    # Portfolio handling
+    # -----------------------------------------
+    def _on_portfolio_update(self, item):
+        """
+        Handle portfolio updates from IB.
+        
+        """
+        try:
+            # Get account and contract
+            account = item.account
+            contract = item.contract
+            
+            # Register the contract
+            self._register_contract(contract, account)
+            
+            # Get symbol
+            symbol = contract.symbol
+            
+            # Create account entry if it doesn't exist
+            if account not in self._portfolio:
+                self._portfolio[account] = {}
+                
+            # Calculate total P&L
+            total_pnl = item.unrealizedPNL + item.realizedPNL
+            
+            # Create or update portfolio item
+            self._portfolio[account][symbol] = {
+                "symbol": symbol,
+                "position": item.position,
+                "marketPrice": item.marketPrice,
+                "marketValue": item.marketValue,
+                "averageCost": item.averageCost,
+                "unrealizedPNL": item.unrealizedPNL,
+                "realizedPNL": item.realizedPNL,
+                "totalPNL": total_pnl,
+                "account": account,
+                "contract": contract
+            }
+            
+            self._logger.debug(f"Updated portfolio for {account}: {symbol} = {item.position} @ {item.marketPrice}")
+
+            # TODO:fire callback
+            # self.ibCallback(caller="handlePortfolio", msg=msg)
+            
+        except Exception as e:
+            self._logger.error(f"Error handling portfolio update: {e}")
 
     # ---------------------------------------
     @property
