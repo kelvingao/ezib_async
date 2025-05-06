@@ -43,13 +43,15 @@ class ezIBAsync:
         # auto-construct for every contract/order
         self.tickerIds     = {0: "SYMBOL"}
         self.contracts     = {}
-        self._contract_details = {}  # multiple expiry/strike/side contracts
-        self.contract_details  = {}
-        self.localSymbolExpiry = {}
 
         # Accounts
-        self._accounts  = {}  # account_id -> account_values
-        self._portfolio = {}  # account_id -> symbol -> portfolio_item
+        self._accounts     = {}  # account_id -> account_values
+        self._positions    = {}
+        self._portfolios   = {}  # account_id -> symbol -> portfolio_item
+        self._contract_details = {}  # multiple expiry/strike/side contracts
+
+        self.contract_details  = {}
+        self.localSymbolExpiry = {}
 
         self._logger = logging.getLogger('ezib_async.ezib')
 
@@ -105,6 +107,10 @@ class ezIBAsync:
             self.isConnected = False
             return False
 
+    def requestAccountUpdates(self, subscribe=True):
+        self.ib.client.reqAccountUpdates(subscribe, self._default_account)
+        self._logger.debug(f"Account Updates Request: {subscribe} issued.")
+
     # ---------------------------------------
     def _register_events_handlers(self):
         """
@@ -120,10 +126,18 @@ class ezIBAsync:
             self.ib.accountValueEvent += self._on_account_value
             self._logger.debug("accountValueEvent handler registered")
 
+            self.ib.positionEvent += self._on_position_update
+            self._logger.debug("positionEvent handler registered")
+
+            self.ib.updatePortfolioEvent += self._on_portfolio_update
+            self._logger.debug("updatePortfolioEvent handler registered")
+
             # Account summary event
             # self.ib.accountSummaryEvent += self._on_account_summary
             # self._logger.debug("accountSummaryEvent handler registered")
 
+    # ---------------------------------------
+    # Accounts handling
     # ---------------------------------------
     def _on_account_value(self, value):
         """
@@ -139,11 +153,12 @@ class ezIBAsync:
                 
             # Set value
             self._accounts[value.account][value.tag] = value.value
-            self._logger.debug(f"Account value update: {value.account} - {value.tag}: {value.value}")
+            # self._logger.debug(f"Account value update: {value.account} - {value.tag}: {value.value}")
             
         except Exception as e:
             self._logger.error(f"Error handling account value update: {e}")
 
+    # ---------------------------------------
     def _on_account_summary(self, summary):
         """
         Handle account summary updates from IB.
@@ -162,6 +177,30 @@ class ezIBAsync:
             
         except Exception as e:
             self._logger.error(f"Error handling account summary update: {e}")
+
+    # ---------------------------------------
+    @property
+    def accounts(self):
+        """
+        Get all account information.
+        
+        """
+        return self._accounts
+
+    @property
+    def account(self):
+        """
+        Get information for the default account.
+        
+        Returns:
+            Dictionary of account information
+
+        """
+        return self.getAccount()
+    
+    @property
+    def accountCodes(self):
+        return list(self._accounts.keys())
 
     # ---------------------------------------
     def _on_disconnected(self):
@@ -872,89 +911,152 @@ class ezIBAsync:
         return tuple(sorted(strikes))
     
     # -----------------------------------------
-    async def _register_contract(self, contract, account = None):
+    async def registerContract(self, contract):
         """
         Register a contract that was received from a callback.
         
         Args:
             contract: Contract object to register
-            account: Account to use, or None to use default
         """
-        if contract.exchange == "":
+        try:
+            await self.ib.qualifyContractsAsync(contract)
+        except Exception as e:
+            self._logger.warning(f"Contract {contract.symbol} is invalid!")
             return
             
-        if self.getConId(contract, account) == 0:
+        if self.getConId(contract) == 0:
+            # self._logger.debug(f'Received a new contract: {contract.symbol} that is not registered!')
             contract_tuple = self.contract_to_tuple(contract)
-            await self.createContract(contract_tuple, account)
+            await self.createContract(contract_tuple)
+
+    # -----------------------------------------
+    # Position handling
+    # -----------------------------------------
+    def _on_position_update(self, position):
+        """
+        Handle position updates from IB.
+        
+        """
+        try:
+            # contract identifier
+            contract_tuple = self.contract_to_tuple(position.contract)
+            contractString = self.contractString(contract_tuple)
+            
+            # try creating the contract
+            asyncio.create_task(self.registerContract(position.contract))
+            
+            # Get symbol
+            symbol = position.contract.symbol
+            
+            # Create account entry if it doesn't exist
+            if position.account not in self._positions:
+                self._positions[position.account] = {}
+                
+            # Create or update position
+            self._positions[position.account][contractString] = {
+                "symbol": contractString,
+                "position": position.position,
+                "avgCost": position.avgCost,
+                "account": position.account
+            }
+            
+            self._logger.debug(
+                f"Updated position for {position.account}: {symbol} = {position.position} @ {position.avgCost}")
+            
+        except Exception as e:
+            self._logger.error(f"Error handling position update: {e}")
+
+        # TODO:fire callback
+        # self.ibCallback(caller="handlePosition", msg=position)
+
+    @property
+    def positions(self):
+        return self.getPositions()
+
+    def getPositions(self, account=None):
+        if len(self._positions) == 0:
+            return {}
+
+        account = self._get_active_account(account)
+
+        if account is None:
+            if len(self._positions) > 1:
+                raise ValueError("Must specify account number as multiple accounts exists.")
+            return self._positions[list(self._positions.keys())[0]]
+
+        if account in self._positions:
+            return self._positions[account]
+
+        raise ValueError("Account %s not found in account list" % account)
 
     # -----------------------------------------
     # Portfolio handling
     # -----------------------------------------
-    def _on_portfolio_update(self, item):
+    def _on_portfolio_update(self, portfolio):
         """
         Handle portfolio updates from IB.
         
         """
         try:
-            # Get account and contract
-            account = item.account
-            contract = item.contract
+            # contract identifier
+            contract_tuple = self.contract_to_tuple(portfolio.contract)
+            contractString = self.contractString(contract_tuple)
             
-            # Register the contract
-            self._register_contract(contract, account)
+            # try creating the contract
+            # asyncio.create_task(self.registerContract(portfolio.contract))
             
             # Get symbol
-            symbol = contract.symbol
+            symbol = portfolio.contract.symbol
             
             # Create account entry if it doesn't exist
-            if account not in self._portfolio:
-                self._portfolio[account] = {}
+            if portfolio.account not in self._portfolios:
+                self._portfolios[portfolio.account] = {}
                 
             # Calculate total P&L
-            total_pnl = item.unrealizedPNL + item.realizedPNL
+            total_pnl = portfolio.unrealizedPNL + portfolio.realizedPNL
             
             # Create or update portfolio item
-            self._portfolio[account][symbol] = {
-                "symbol": symbol,
-                "position": item.position,
-                "marketPrice": item.marketPrice,
-                "marketValue": item.marketValue,
-                "averageCost": item.averageCost,
-                "unrealizedPNL": item.unrealizedPNL,
-                "realizedPNL": item.realizedPNL,
+            self._portfolios[portfolio.account][contractString] = {
+                "symbol": contractString,
+                "position": portfolio.position,
+                "marketPrice": portfolio.marketPrice,
+                "marketValue": portfolio.marketValue,
+                "averageCost": portfolio.averageCost,
+                "unrealizedPNL": portfolio.unrealizedPNL,
+                "realizedPNL": portfolio.realizedPNL,
                 "totalPNL": total_pnl,
-                "account": account,
-                "contract": contract
+                "account": portfolio.account
             }
             
-            self._logger.debug(f"Updated portfolio for {account}: {symbol} = {item.position} @ {item.marketPrice}")
+            self._logger.debug(
+                f"Updated portfolio for {portfolio.account}: {symbol} = {portfolio.position} @ {portfolio.marketPrice}")
 
             # TODO:fire callback
-            # self.ibCallback(caller="handlePortfolio", msg=msg)
+            # self.ibCallback(caller="handlePortfolio", msg=portfolio)
             
         except Exception as e:
             self._logger.error(f"Error handling portfolio update: {e}")
 
-    # ---------------------------------------
     @property
-    def accounts(self):
-        """
-        Get all account information.
-        
-        """
-        return self._accounts
+    def portfolios(self):
+        return self._portfolios
 
     @property
-    def account(self):
-        """
-        Get information for the default account.
-        
-        Returns:
-            Dictionary of account information
+    def portfolio(self):
+        return self.getPortfolio()
 
-        """
-        return self.getAccount()
-    
-    @property
-    def accountCodes(self):
-        return list(self._accounts.keys())
+    def getPortfolio(self, account=None):
+        if len(self._portfolios) == 0:
+            return {}
+
+        account = self._get_active_account(account)
+
+        if account is None:
+            if len(self._portfolios) > 1:
+                raise ValueError("Must specify account number as multiple accounts exists.")
+            return self._portfolios[list(self._portfolios.keys())[0]]
+
+        if account in self._portfolios:
+            return self._portfolios[account]
+
+        raise ValueError("Account %s not found in account list" % account)
