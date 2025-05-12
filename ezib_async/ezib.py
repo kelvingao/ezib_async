@@ -29,6 +29,32 @@ class ezIBAsync:
     managing connections, accounts, positions, portfolios, contracts, and orders.
     """
     
+    events = (
+        "pendingMarketTickersEvent",
+        "pendingOptionsTickersEvent"
+    )
+    
+    @staticmethod
+    def roundClosestValid(val, res = 0.01, decimals = None):
+        """
+        Round to closest valid resolution.
+        
+        Args:
+            val: Value to round
+            res: Resolution to round to
+            decimals: Number of decimal places
+            
+        Returns:
+            Rounded value
+        """
+        if val is None:
+            return None
+            
+        if decimals is None and "." in str(res):
+            decimals = len(str(res).split('.')[1])
+            
+        return round(round(val / res) * res, decimals)
+    
     def __init__(self, ibhost='127.0.0.1', ibport=4001, 
                  ibclient=1, account=None):
         """
@@ -51,6 +77,10 @@ class ezIBAsync:
         # auto-construct for every contract/order
         self.tickerIds     = {0: "SYMBOL"}
         self.contracts     = {}
+        self.orders        = {}
+        self.account_orders= {}
+        self.account_symbols_orders= {}
+        self.symbol_orders = {}
 
         # Accounts
         self._accounts     = {}  # account_id -> account_values
@@ -980,6 +1010,144 @@ class ezIBAsync:
         return await self.createContract(contract_tuple, combo_legs=legs)
 
     # ---------------------------------------
+    def createOrder(self, quantity, price=0., stop=0., tif="DAY",
+                fillorkill=False, iceberg=False, transmit=True, rth=False,
+                account=None, **kwargs):
+        """
+        Create a trading order
+        
+        Parameters:
+            quantity: Order quantity, positive for buy, negative for sell
+            price: Limit price, 0 for market order
+            stop: Stop price
+            tif: Time-in-force, such as DAY, GTC, IOC, GTD, OPG, ...
+            fillorkill: Whether to use fill-or-kill
+            iceberg: Whether to use iceberg order
+            transmit: Whether to transmit the order immediately
+            rth: Whether order is valid only during regular trading hours
+            account: Trading account
+            **kwargs: Additional parameters
+        
+        Returns:
+            Order object
+        """
+        
+        # Create order object
+        order = Order()
+        
+        # Set order direction and quantity
+        order.action = "BUY" if quantity > 0 else "SELL"
+        order.totalQuantity = abs(int(quantity))
+        
+        # Set order type
+        if "orderType" in kwargs:
+            order.orderType = kwargs["orderType"]
+            if kwargs["orderType"] == "MOO":
+                order.orderType = "MKT"
+                tif = "OPG"
+            elif kwargs["orderType"] == "LOO":
+                order.orderType = "LMT"
+                tif = "OPG"
+        else:
+            order.orderType = "MKT" if price == 0 else "LMT"
+        
+        # Set prices
+        order.lmtPrice = price  # Limit price
+        order.auxPrice = kwargs["auxPrice"] if "auxPrice" in kwargs else stop  # Stop price
+        
+        # Set time-in-force and execution conditions
+        order.tif = tif.upper()  
+        order.allOrNone = bool(fillorkill)
+        order.hidden = bool(iceberg)
+        order.transmit = bool(transmit)
+        order.outsideRth = bool(rth == False and tif.upper() != "OPG")
+        
+        # Set account
+        account_code = self._get_active_account(account)
+        if account_code is not None:
+            order.account = account_code
+        
+        # Iceberg order display quantity
+        if iceberg and ("blockOrder" in kwargs):
+            order.blockOrder = kwargs["blockOrder"]
+        
+        # Relative order percentage offset
+        if "percentOffset" in kwargs:
+            order.percentOffset = kwargs["percentOffset"]
+        
+        # Parent order ID, used for bracket orders and trailing stops
+        if "parentId" in kwargs:
+            order.parentId = kwargs["parentId"]
+        
+        # OCA group (Order Cancels All), used for bracket orders and trailing stops
+        if "ocaGroup" in kwargs:
+            order.ocaGroup = kwargs["ocaGroup"]
+            if "ocaType" in kwargs:
+                order.ocaType = kwargs["ocaType"]
+            else:
+                order.ocaType = 2  # Proportionally reduce remaining orders' size
+        
+        # Trailing stop order
+        if "trailingPercent" in kwargs:
+            order.trailingPercent = kwargs["trailingPercent"]
+        
+        # Trailing limit stop order
+        if "trailStopPrice" in kwargs:
+            order.trailStopPrice = kwargs["trailStopPrice"]
+        
+        return order
+    
+    # ---------------------------------------
+    def placeOrder(self, contract, order, orderId=None, account=None):
+        """ 
+        Place order on IB TWS
+        
+        Parameters:
+            contract: Contract object
+            order: Order object
+            orderId: Order ID, uses current orderId if None
+            account: Account code
+            
+        Returns:
+            Order ID
+        """
+        # Ensure prices conform to contract's minimum tick size
+        ticksize = self.contractDetails(contract)["minTick"]
+        order.lmtPrice = self.roundClosestValid(order.lmtPrice, ticksize)
+        order.auxPrice = self.roundClosestValid(order.auxPrice, ticksize)
+        
+        # Set account
+        account_code = self._get_active_account(account)
+        if account_code is not None:
+            order.account = account_code
+        
+        # Use ib_async's placeOrder method
+        trade = self.ib.placeOrder(contract, order)
+        # trade.statusEvent += self._on_order_status
+
+        # self.ib.sleep(0.1)
+        
+        # Record order information
+        self.orders[order.orderId] = {
+            "id":           order.orderId,
+            "symbol":       self.contractString(contract),
+            "contract":     contract,
+            "status":       "SENT",
+            "reason":       None,
+            "avgFillPrice": 0.,
+            "parentId":     0,
+            # "time":         datetime.fromtimestamp(int(self.time)),
+            "account":      None
+        }
+        
+        # Record account information
+        if hasattr(order, "account"):
+            self.orders[order.orderId]["account"] = order.account
+        
+        # Return order ID
+        return trade
+
+    # ---------------------------------------
     async def requestContractDetails(self, contract):
         """
         Request contract details from IB API.
@@ -1338,3 +1506,279 @@ class ezIBAsync:
             return self._portfolios[account]
 
         raise ValueError("Account %s not found in account list" % account)
+
+    # -----------------------------------------
+    # Order Creation Methods
+    # -----------------------------------------
+    def createTargetOrder(self, quantity, parentId=0,
+            target=0., orderType=None, transmit=True, group=None, tif="DAY",
+            rth=False, account=None):
+        """ 
+        Creates TARGET order 
+        
+        Args:
+            quantity: Order quantity
+            parentId: Parent order ID
+            target: Target price
+            orderType: Order type
+            transmit: Whether to transmit the order
+            group: OCA group name
+            tif: Time-in-force
+            rth: Whether order is valid only during regular trading hours
+            account: Trading account
+            
+        Returns:
+            Order object
+        """
+        params = {
+            "quantity": quantity,
+            "price": target,
+            "transmit": transmit,
+            "orderType": orderType,
+            "ocaGroup": group,
+            "parentId": parentId,
+            "rth": rth,
+            "tif": tif,
+            "account": self._get_active_account(account)
+        }
+        
+        # default order type is "Market if Touched"
+        if orderType is None:
+            params['orderType'] = "MIT"
+            params['auxPrice'] = target
+            del params['price']
+
+        order = self.createOrder(**params)
+        return order
+
+    # -----------------------------------------
+    def createStopOrder(self, quantity, parentId=0, stop=0., trail=None,
+            transmit=True, trigger=None, group=None, stop_limit=False,
+            rth=False, tif="DAY", account=None, **kwargs):
+        """ 
+        Creates STOP order 
+        
+        Args:
+            quantity: Order quantity
+            parentId: Parent order ID
+            stop: Stop price
+            trail: Trail type ('percent' or amount)
+            transmit: Whether to transmit the order
+            trigger: Trigger price
+            group: OCA group name
+            stop_limit: Whether to use a stop-limit order
+            rth: Whether order is valid only during regular trading hours
+            tif: Time-in-force
+            account: Trading account
+            **kwargs: Additional parameters
+            
+        Returns:
+            Order object
+        """
+        stop_limit_price = 0
+        if stop_limit is not False:
+            if stop_limit is True:
+                stop_limit_price = stop
+            else:
+                try:
+                    stop_limit_price = float(stop_limit)
+                except Exception:
+                    stop_limit_price = stop
+
+        trailStopPrice = trigger if trigger else stop_limit_price
+        if quantity > 0:
+            trailStopPrice -= abs(stop)
+        elif quantity < 0:
+            trailStopPrice -= abs(stop)
+
+        order_data = {
+            "quantity": quantity,
+            "trailStopPrice": trailStopPrice,
+            "stop": abs(stop),
+            "price": stop_limit_price,
+            "transmit": transmit,
+            "ocaGroup": group,
+            "parentId": parentId,
+            "rth": rth,
+            "tif": tif,
+            "account": self._get_active_account(account)
+        }
+
+        if trail:
+            order_data['orderType'] = "TRAIL"
+            if "orderType" in kwargs:
+                order_data['orderType'] = kwargs["orderType"]
+            elif stop_limit:
+                order_data['orderType'] = "TRAIL LIMIT"
+
+            if trail == "percent":
+                order_data['trailingPercent'] = stop
+            else:
+                order_data['auxPrice'] = stop
+        else:
+            order_data['orderType'] = "STP"
+            if stop_limit:
+                order_data['orderType'] = "STP LMT"
+
+        order = self.createOrder(**order_data)
+        return order
+    
+    # -----------------------------------------
+    def createTriggerableTrailingStop(self, symbol, quantity=1,
+            triggerPrice=0, trailPercent=100., trailAmount=0.,
+            parentId=0, stopOrderId=None, targetOrderId=None,
+            account=None, **kwargs):
+        """
+        Adds order to triggerable list
+        
+        IMPORTANT! For trailing stop to work you'll need
+            1. real time market data subscription for the tracked ticker
+            2. the python/algo script to be kept alive
+            
+        Args:
+            symbol: Contract symbol
+            quantity: Order quantity
+            triggerPrice: Price at which to trigger the trailing stop
+            trailPercent: Trailing percentage
+            trailAmount: Trailing amount
+            parentId: Parent order ID
+            stopOrderId: Stop order ID
+            targetOrderId: Target order ID
+            account: Trading account
+            **kwargs: Additional parameters
+            
+        Returns:
+            Dictionary with trailing stop parameters
+        """
+        # Initialize the triggerableTrailingStops dictionary if it doesn't exist
+        if not hasattr(self, 'triggerableTrailingStops'):
+            self.triggerableTrailingStops = {}
+
+        ticksize = self.contractDetails(symbol)["minTick"]
+
+        self.triggerableTrailingStops[symbol] = {
+            "parentId": parentId,
+            "stopOrderId": stopOrderId,
+            "targetOrderId": targetOrderId,
+            "triggerPrice": triggerPrice,
+            "trailAmount": abs(trailAmount),
+            "trailPercent": abs(trailPercent),
+            "quantity": quantity,
+            "ticksize": ticksize,
+            "account": self._get_active_account(account)
+        }
+
+        return self.triggerableTrailingStops[symbol]
+
+    # -----------------------------------------
+    def createBracketOrder(self, contract, quantity,
+                entry=0., target=0., stop=0.,
+                targetType=None, stopType=None,
+                trailingStop=False,  # (pct/amt/False)
+                trailingValue=None,  # value to train by (amt/pct)
+                trailingTrigger=None,  # (price where hard stop starts trailing)
+                group=None, tif="DAY",
+                fillorkill=False, iceberg=False, rth=False,
+                transmit=True, account=None, **kwargs):
+            """
+            Creates One Cancels All Bracket Order
+            
+            Args:
+                contract: Contract object
+                quantity: Order quantity
+                entry: Entry price (0 for market order)
+                target: Target/profit price (0 to disable)
+                stop: Stop/loss price (0 to disable)
+                targetType: Target order type
+                stopType: Stop order type
+                trailingStop: Trailing stop type ('pct', 'amt', or False)
+                trailingValue: Value to trail by (amount or percentage)
+                trailingTrigger: Price where hard stop starts trailing
+                group: OCA group name
+                tif: Time-in-force
+                fillorkill: Whether to use fill-or-kill
+                iceberg: Whether to use iceberg order
+                rth: Whether order is valid only during regular trading hours
+                transmit: Whether to transmit the order
+                account: Trading account
+                **kwargs: Additional parameters
+                
+            Returns:
+                Dictionary with order IDs
+            """
+            import time
+            
+            if group is None:
+                group = "bracket_" + str(int(time.time()))
+
+            account = self._get_active_account(account)
+
+            # main order
+            entryOrder = self.createOrder(quantity, price=entry, transmit=False,
+                            tif=tif, fillorkill=fillorkill, iceberg=iceberg,
+                            rth=rth, account=account, **kwargs)
+
+            trade = self.placeOrder(contract, entryOrder)
+            entryOrderId = trade.order.orderId
+
+            # target
+            targetOrderId = 0
+            if target > 0 or targetType == "MOC":
+                targetOrder = self.createTargetOrder(-quantity,
+                                parentId=entryOrderId,
+                                target=target,
+                                transmit=False if stop > 0 else True,
+                                orderType=targetType,
+                                group=group,
+                                rth=rth,
+                                tif=tif,
+                                account=account
+                            )
+
+                targetTrade = self.placeOrder(contract, targetOrder)
+                targetOrderId = targetTrade.order.orderId
+
+            # stop
+            stopOrderId = 0
+            if stop > 0:
+                stop_limit = stopType and stopType.upper() in ["LIMIT", "LMT"]
+                
+                stopOrder = self.createStopOrder(-quantity,
+                                parentId=entryOrderId,
+                                stop=stop,
+                                trail=None,
+                                transmit=transmit,
+                                group=group,
+                                rth=rth,
+                                tif=tif,
+                                stop_limit=stop_limit,
+                                account=account
+                            )
+
+                stopTrade = self.placeOrder(contract, stopOrder)
+                stopOrderId = stopTrade.order.orderId
+
+                # triggered trailing stop?
+                if trailingStop and trailingTrigger and trailingValue:
+                    trailing_params = {
+                        "symbol": self.contractString(contract),
+                        "quantity": -quantity,
+                        "triggerPrice": trailingTrigger,
+                        "parentId": entryOrderId,
+                        "stopOrderId": stopOrderId,
+                        "targetOrderId": targetOrderId if targetOrderId != 0 else None,
+                        "account": account
+                    }
+                    if trailingStop.lower() in ['amt', 'amount']:
+                        trailing_params["trailAmount"] = trailingValue
+                    elif trailingStop.lower() in ['pct', 'percent']:
+                        trailing_params["trailPercent"] = trailingValue
+
+                    self.createTriggerableTrailingStop(**trailing_params)
+
+            return {
+                "group": group,
+                "entryOrderId": entryOrderId,
+                "targetOrderId": targetOrderId,
+                "stopOrderId": stopOrderId
+            }
