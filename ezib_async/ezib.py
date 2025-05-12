@@ -8,8 +8,14 @@ using ib_async for asynchronous execution and event handling.
 import asyncio
 import sys
 import logging
+import pandas as pd
 
-from ib_async import IB, Contract, ComboLeg
+from pandas import DataFrame
+from ib_async import IB, Contract, ComboLeg, Order
+
+from .mappings import *
+
+from eventkit import Event
 
 # Check Python version
 if sys.version_info < (3, 11):
@@ -34,6 +40,8 @@ class ezIBAsync:
             ibclient (int): Client ID for IB connection
             account (str, optional): Default account to use
         """
+        self._createEvents()
+
         # Store connection parameters
         self._ibhost = ibhost
         self._ibport = ibport
@@ -56,12 +64,50 @@ class ezIBAsync:
 
         self._logger = logging.getLogger('ezib_async.ezib')
 
+        # holds market data
+        tickDF = DataFrame({
+            "datetime": [0], "bid": [0], "bidsize": [0],
+            "ask": [0], "asksize": [0], "last": [0], "lastsize": [0]
+        })
+        tickDF.set_index('datetime', inplace=True)
+        self.marketData = {0: tickDF}  # idx = tickerId
+
+        # holds orderbook data
+        l2DF = DataFrame(index=range(5), data={
+            "bid": 0, "bidsize": 0,
+            "ask": 0, "asksize": 0
+        })
+        self.marketDepthData = {0: l2DF}  # idx = tickerId
+
+        # holds options data
+        optionsDF = DataFrame({
+            "datetime": [0], "oi": [0], "volume": [0], "underlying": [0], "iv": [0],
+            "bid": [0], "bidsize": [0], "ask": [0], "asksize": [0], "last": [0], "lastsize": [0],
+            # opt field
+            "price": [0], "dividend": [0], "imp_vol": [0], "delta": [0],
+            "gamma": [0], "vega": [0], "theta": [0],
+            "last_price": [0], "last_dividend": [0], "last_imp_vol": [0], "last_delta": [0],
+            "last_gamma": [0], "last_vega": [0], "last_theta": [0],
+            "bid_price": [0], "bid_dividend": [0], "bid_imp_vol": [0], "bid_delta": [0],
+            "bid_gamma": [0], "bid_vega": [0], "bid_theta": [0],
+            "ask_price": [0], "ask_dividend": [0], "ask_imp_vol": [0], "ask_delta": [0],
+            "ask_gamma": [0], "ask_vega": [0], "ask_theta": [0],
+        })
+        optionsDF.set_index('datetime', inplace=True)
+        self.optionsData = {0: optionsDF}  # idx = tickerId
+
         # Initialize the IB client directly
         self.ib = IB()
         self.isConnected = False
         self._disconnected_by_user = False
 
         self._register_events_handlers()
+
+    def _createEvents(self):
+
+        self.pendingMarketTickersEvent = Event("pendingMarketTickersEvent")
+        self.pendingOptionsTickersEvent = Event("pendingOptionsTickersEvent")
+
 
     # ---------------------------------------
     async def connectAsync(self, ibhost=None, ibport=None, 
@@ -132,9 +178,195 @@ class ezIBAsync:
             self.ib.updatePortfolioEvent += self._on_portfolio_update
             self._logger.debug("updatePortfolioEvent handler registered")
 
+            # Market data events - use pendingTickersEvent for consolidated updates
+            self.ib.pendingTickersEvent += self._on_pending_tickers
+            self._logger.debug("pendingTickersEvent handler registered")
+
             # Account summary event
             # self.ib.accountSummaryEvent += self._on_account_summary
             # self._logger.debug("accountSummaryEvent handler registered")
+
+    # ---------------------------------------
+    async def requestMarketData(self, contracts=None, snapshot=False):
+        """
+        Register to streaming market data updates.
+        
+        Args:
+            contracts: Contract or list of contracts to request market data for.
+                       If None, uses all contracts in self.contracts.
+            snapshot: If True, request a snapshot instead of streaming data.
+        """
+            
+        # Use all contracts if none specified
+        if contracts is None:
+            contracts = list(self.contracts.values())
+        elif not isinstance(contracts, list):
+            contracts = [contracts]
+            
+        for contract in contracts:
+            # Skip multi-contracts (they need to be expanded first)
+            if self.isMultiContract(contract):
+                self._logger.debug(f"Skipping multi-contract: {contract.symbol}")
+                continue
+                
+            try:
+                # Get ticker ID for the contract
+                ticker_id = self.tickerId(self.contractString(contract))
+                
+                # Request market data
+                self._logger.info(f"Requesting market data for {contract.symbol} (ID: {id(contract)})")
+                
+                # # Different handling for options
+                # if contract.secType in ("OPT", "FOP"):
+                #     # Initialize options data structure for this ticker
+                #     if ticker_id not in self.optionsData:
+                #         self.optionsData[ticker_id] = {
+                #             'iv': 0, 'oi': 0, 'volume': 0, 'underlying': 0,
+                #             'bid': 0, 'bidsize': 0, 'ask': 0, 'asksize': 0, 'last': 0, 'lastsize': 0,
+                #             'delta': 0, 'gamma': 0, 'vega': 0, 'theta': 0,
+                #         }
+                    
+                #     # Request market data with option computation
+                #     self.ib.reqMktData(contract, '', snapshot, False)
+                # else:
+                #     # Initialize market data structure for this ticker
+                #     if ticker_id not in self.marketData:
+                #         self.marketData[ticker_id] = {
+                #             'bid': 0, 'bidsize': 0, 'ask': 0, 'asksize': 0, 'last': 0, 'lastsize': 0
+                #         }
+                    
+                    # Request market data
+                self.ib.reqMktData(contract, '', snapshot, False)
+                
+                # Small delay to avoid overwhelming IB API (max 500 requests/second)
+                await asyncio.sleep(0.0021)
+                
+            except Exception as e:
+                self._logger.error(f"Error requesting market data for {contract.symbol}: {e}")
+    
+    def cancelMarketData(self, contracts=None):
+        """
+        Cancel streaming market data for contracts.
+        
+        Args:
+            contracts: Contract or list of contracts to cancel market data for.
+                      If None, cancels for all contracts in self.contracts.
+        """
+        if not self.isConnected:
+            self._logger.info("Not connected to IB")
+            return
+            
+        # Use all contracts if none specified
+        if contracts is None:
+            contracts = list(self.contracts.values())
+        elif not isinstance(contracts, list):
+            contracts = [contracts]
+            
+        for contract in contracts:
+            try:
+                # Skip multi-contracts
+                if self.isMultiContract(contract):
+                    continue
+                    
+                # Cancel market data
+                self._logger.info(f"Canceling market data for {contract.symbol} (ID: {id(contract)})")
+                self.ib.cancelMktData(contract)
+                
+            except Exception as e:
+                self._logger.error(f"Error canceling market data for {contract.symbol}: {e}")
+
+    # -----------------------------------------
+    # Market data event handlers
+    # -----------------------------------------
+    def _on_pending_tickers(self, tickers):
+        """
+        Handle consolidated ticker updates from IB.
+        
+        This single handler processes all types of market data updates (price, size, 
+        option computation, etc.) using ib_async's consolidated ticker objects.
+        
+        Args:
+            tickers: List of Ticker objects with updated data
+        """
+
+        market_tickers = []
+        options_tickers = []
+
+        for t in tickers:
+            if t.contract.secType in ("OPT", "FOP"):
+                options_tickers.append(t)
+            else:
+                market_tickers.append(t)
+                # contract = t.contract
+                # symbol = self.contractString(contract)
+                # ticker_id = self.tickerId(symbol)
+
+                # is_option = contract.secType in ("OPT", "FOP")
+                # df2use = self.optionsData if is_option else self.marketData
+
+                # # Ensure the ticker exists in our data structure
+                # if ticker_id not in df2use:
+                #     df2use[ticker_id] = df2use[0].copy()
+                    
+                # # Update common market data fields
+                # for field, attr in COMMON_FIELD_MAPPING.items():
+                #     if field == "datetime":
+                #         df2use[ticker_id].index = [getattr(t, attr)]
+                #     else:
+                #         df2use[ticker_id][field] = getattr(t, attr)
+
+                # if is_option:
+
+                #     # Handle open interest field based on contract type
+                #     if contract.secType == "OPT":
+                #         if contract.right == "C" and hasattr(t, "callOpenInterest"):
+                #             df2use[ticker_id]['oi'] = t.callOpenInterest
+                #         elif contract.right == "P" and hasattr(t, "putOpenInterest"):
+                #             df2use[ticker_id]['oi'] = t.putOpenInterest
+                #     elif contract.secType == "FOP" and hasattr(t, "futuresOpenInterest"):
+                #         df2use[ticker_id]['oi'] = t.futuresOpenInterest
+                    
+                #     # Handle implied volatility - prioritize impliedVolatility if available
+                #     if hasattr(t, "impliedVolatility") and t.impliedVolatility is not None and t.impliedVolatility < 1e6:
+                #         df2use[ticker_id]['iv'] = t.impliedVolatility
+                #     elif hasattr(t, "lastGreeks") and hasattr(t.lastGreeks, "impliedVol") and t.lastGreeks.impliedVol is not None:
+                #         df2use[ticker_id]['iv'] = t.lastGreeks.impliedVol
+                                    
+                #     if t.modelGreeks:
+                #         for key, attr in OPT_FOP_MODELGREEKS_MAPPING.items():
+                #             if hasattr(t.modelGreeks, attr):
+                #                 val = getattr(t.modelGreeks, attr)
+                #                 if val and val < 1e6:
+                #                     df2use[ticker_id][key] = val
+                    
+                #     if t.lastGreeks:
+                #         for key, attr in OPT_FOP_LASTGREEKS_MAPPING.items():
+                #             if hasattr(t.lastGreeks, attr):
+                #                 val = getattr(t.lastGreeks, attr)
+                #                 if val and val < 1e6:
+                #                     df2use[ticker_id][key] = val
+                    
+                #     if t.bidGreeks:
+                #         for key, attr in OPT_FOP_BIDGREEKS_MAPPING.items():
+                #             if hasattr(t.bidGreeks, attr):
+                #                 val = getattr(t.bidGreeks, attr)
+                #                 if val and val < 1e6:
+                #                     df2use[ticker_id][key] = val
+
+                #     if t.askGreeks:
+                #         for key, attr in OPT_FOP_ASKGREEKS_MAPPING.items():
+                #             if hasattr(t.askGreeks, attr):
+                #                 val = getattr(t.askGreeks, attr)
+                #                 if val and val < 1e6:
+                #                     df2use[ticker_id][key] = val
+
+        if market_tickers:
+            self.pendingMarketTickersEvent.emit(market_tickers)
+        if options_tickers:
+            self.pendingOptionsTickersEvent.emit(options_tickers)
+            
+            # except Exception as e:
+            #     self._logger.error(f"Error handling ticker update for {contract.symbol if hasattr(contract, 'symbol') else 'unknown'}: {e}")
 
     # ---------------------------------------
     # Accounts handling
@@ -318,7 +550,7 @@ class ezIBAsync:
         """
         # Handle contract object
         symbol = contract_identifier
-        if isinstance(symbol, Contract):
+        if isinstance(symbol, (Contract, tuple)):
             symbol = self.contractString(symbol)
             
         # Check if symbol already has a ticker ID
@@ -487,6 +719,10 @@ class ezIBAsync:
         Returns:
             Created contract object
         """
+        if self.getConId(contract_identifier):
+            self._logger.debug(f"The contract: {contract_identifier} has been registered.")
+            return self.contracts[self.tickerId(contract_identifier)]
+        print('create new contract')
         if isinstance(contract_identifier, tuple):
             # Create a new Contract object
             newContract = Contract()
