@@ -1,15 +1,22 @@
 [project]
 name = "ezib-async"
-version = "0.1.0"
-description = "Add your description here"
+dynamic = ["version"]
+description = "An asynchronous Python wrapper for Interactive Brokers API based on ib_async, providing a more Pythonic and asyncio-friendly interface."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "ib-async>=1.0.3",
+    "numba>=0.61.2",
     "pandas>=2.2.3",
+    "uvloop>=0.21.0",
 ]
 
-[dependency-groups]
+[project.optional-dependencies]
 dev = [
     "pytest-asyncio>=0.26.0",
 ]
+[tool.setuptools]
+packages = ["ezib_async"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ezib_async.version.__version__"}
