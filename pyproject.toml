@@ -17,6 +17,7 @@ dev = [
 ]
 [tool.setuptools]
 packages = ["ezib_async"]
+package-dir = {"" = "src"}
 
 [tool.setuptools.dynamic]
 version = {attr = "ezib_async.version.__version__"}
