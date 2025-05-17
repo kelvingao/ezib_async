@@ -1,23 +1,43 @@
 """
-Asynchronous Interactive Brokers API client.
+MIT License
 
-This module provides a high-level, Pythonic interface to the Interactive Brokers API,
-using ib_async for asynchronous execution and event handling.
+Copyright (c) 2025 Kelvin Gao
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 """
 
-import asyncio
 import sys
+import asyncio
 import logging
-import pandas as pd
 
 from pandas import DataFrame
-from ib_async import IB, Contract, ComboLeg, Order
-
-from .mappings import *
+from typing import Dict, List
+from ib_async import (
+    IB,
+    AccountValue, Position, PortfolioItem,
+    Contract, Stock, Future, Forex, Option, Index,
+    ComboLeg, Order
+)
 
 from eventkit import Event
 
-# Check Python version
+# check python version
 if sys.version_info < (3, 11):
     raise SystemError("ezIBAsync requires Python version >= 3.11")
 
@@ -68,29 +88,28 @@ class ezIBAsync:
         """
         self._createEvents()
 
-        # Store connection parameters
+        # store connection parameters
         self._ibhost = ibhost
         self._ibport = ibport
         self._ibclient = ibclient
         self._default_account = account
         
         # auto-construct for every contract/order
-        self.tickerIds     = {0: "SYMBOL"}
-        self.contracts     = {}
-        self.orders        = {}
-        self.account_orders= {}
-        self.account_symbols_orders= {}
-        self.symbol_orders = {}
+        self.tickerIds: Dict[int, str] = {0: "SYMBOL"}
+        self.contracts: List[Contract] = []
+        self.orders: Dict[int, Order] = {}
+        self.account_orders: Dict[str, Dict[int, Order]] = {}
+        self.account_symbols_orders: Dict[str, Dict[str, List[Order]]] = {}
+        self.symbol_orders: Dict[str, List[Order]] = {}
 
-        # Accounts
-        self._accounts     = {}  # account_id -> account_values
-        self._positions    = {}
-        self._portfolios   = {}  # account_id -> symbol -> portfolio_item
-        self._portfolios_items = {}
-        self._contract_details = {}  # multiple expiry/strike/side contracts
+        # accounts
+        self._accounts: Dict[str, List[AccountValue]] = {}  # accountId -> accountValues
+        self._positions: Dict[str, Dict[str, Position]] = {}
+        self._portfolios: Dict[str, Dict[str, PortfolioItem]] = {}  # accountId -> contractString -> portfolioItem
+        self._contract_details: List[dict] = []  # multiple expiry/strike/side contracts
 
-        self.contract_details  = {}
-        self.localSymbolExpiry = {}
+        self.contract_details: Dict[str, dict] = {}
+        self.localSymbolExpiry: Dict[str, str] = {}
 
         self._logger = logging.getLogger('ezib_async.ezib')
 
@@ -100,14 +119,14 @@ class ezIBAsync:
             "ask": [0], "asksize": [0], "last": [0], "lastsize": [0]
         })
         tickDF.set_index('datetime', inplace=True)
-        self.marketData = {0: tickDF}  # idx = tickerId
+        self.marketData: Dict[int, DataFrame] = {0: tickDF}  # idx = tickerId
 
         # holds orderbook data
         l2DF = DataFrame(index=range(5), data={
             "bid": 0, "bidsize": 0,
             "ask": 0, "asksize": 0
         })
-        self.marketDepthData = {0: l2DF}  # idx = tickerId
+        self.marketDepthData: Dict[int, DataFrame] = {0: l2DF}  # idx = tickerId
 
         # holds options data
         optionsDF = DataFrame({
@@ -124,11 +143,11 @@ class ezIBAsync:
             "ask_gamma": [0], "ask_vega": [0], "ask_theta": [0],
         })
         optionsDF.set_index('datetime', inplace=True)
-        self.optionsData = {0: optionsDF}  # idx = tickerId
+        self.optionsData: Dict[int, DataFrame] = {0: optionsDF}  # idx = tickerId
 
         # Initialize the IB client directly
         self.ib = IB()
-        self.isConnected = False
+        self.connected = False
         self._disconnected_by_user = False
 
         self._register_events_handlers()
@@ -137,7 +156,7 @@ class ezIBAsync:
 
         self.pendingMarketTickersEvent = Event("pendingMarketTickersEvent")
         self.pendingOptionsTickersEvent = Event("pendingOptionsTickersEvent")
-
+        self.updateMarketDepthEvent = Event("upadteMarketDepthEvent")
 
     # ---------------------------------------
     async def connectAsync(self, ibhost=None, ibport=None, 
@@ -159,14 +178,14 @@ class ezIBAsync:
         
         try:
             # Connect using the IB client
-            if self.isConnected:
+            if self.connected:
                 return
 
             self._logger.info(f"Connecting to IB at {self._ibhost}:{self._ibport} (client ID: {self._ibclient})")
             await self.ib.connectAsync(host=self._ibhost, port=self._ibport, clientId=self._ibclient, account=self._default_account)
             
             # Update connection state
-            self.isConnected = self.ib.isConnected()
+            self.connected = self.ib.isConnected()
             self._logger.info("Connected to IB successfully")
             self._disconnected_by_user = False
 
@@ -179,12 +198,11 @@ class ezIBAsync:
                     self._logger.warning(f"Switched default account to {self._default_account}")
             else:
                 self._default_account = self.accountCodes[0]
-                
-            # self.requestAccountUpdates(True, self._default_account)
+                self.ib.client.reqAccountUpdates(True, self._default_account)
                 
         except Exception as e:
             self._logger.error(f"Error connecting to IB: {e}")
-            self.isConnected = False
+            self.connected = False
             return False
 
     # ---------------------------------------
@@ -194,27 +212,16 @@ class ezIBAsync:
         
         """
         if self.ib is not None:
-            # Register disconnection handler
+            # disconnection handler
             self.ib.disconnectedEvent += self._on_disconnected
-            self._logger.debug("disconnnectedEvent handler registered")
 
-            # Account value event
+            # accounts info handlers
             self.ib.accountValueEvent += self._on_account_value
-            self._logger.debug("accountValueEvent handler registered")
-
             self.ib.positionEvent += self._on_position_update
-            self._logger.debug("positionEvent handler registered")
-
             self.ib.updatePortfolioEvent += self._on_portfolio_update
-            self._logger.debug("updatePortfolioEvent handler registered")
 
-            # Market data events - use pendingTickersEvent for consolidated updates
+            # tickers handler
             self.ib.pendingTickersEvent += self._on_pending_tickers
-            self._logger.debug("pendingTickersEvent handler registered")
-
-            # Account summary event
-            # self.ib.accountSummaryEvent += self._on_account_summary
-            # self._logger.debug("accountSummaryEvent handler registered")
 
     # ---------------------------------------
     async def requestMarketData(self, contracts=None, snapshot=False):
@@ -229,7 +236,7 @@ class ezIBAsync:
             
         # Use all contracts if none specified
         if contracts is None:
-            contracts = list(self.contracts.values())
+            contracts = self.contracts
         elif not isinstance(contracts, list):
             contracts = [contracts]
             
@@ -241,31 +248,12 @@ class ezIBAsync:
                 
             try:
                 # Get ticker ID for the contract
-                ticker_id = self.tickerId(self.contractString(contract))
+                contractSring = self.contractString(contract)
                 
                 # Request market data
-                self._logger.info(f"Requesting market data for {contract.symbol} (ID: {id(contract)})")
-                
-                # # Different handling for options
-                # if contract.secType in ("OPT", "FOP"):
-                #     # Initialize options data structure for this ticker
-                #     if ticker_id not in self.optionsData:
-                #         self.optionsData[ticker_id] = {
-                #             'iv': 0, 'oi': 0, 'volume': 0, 'underlying': 0,
-                #             'bid': 0, 'bidsize': 0, 'ask': 0, 'asksize': 0, 'last': 0, 'lastsize': 0,
-                #             'delta': 0, 'gamma': 0, 'vega': 0, 'theta': 0,
-                #         }
+                self._logger.info(f"Requesting market data for {contract.symbol} ({contractSring})")
                     
-                #     # Request market data with option computation
-                #     self.ib.reqMktData(contract, '', snapshot, False)
-                # else:
-                #     # Initialize market data structure for this ticker
-                #     if ticker_id not in self.marketData:
-                #         self.marketData[ticker_id] = {
-                #             'bid': 0, 'bidsize': 0, 'ask': 0, 'asksize': 0, 'last': 0, 'lastsize': 0
-                #         }
-                    
-                    # Request market data
+                # Request market data
                 self.ib.reqMktData(contract, '', snapshot, False)
                 
                 # Small delay to avoid overwhelming IB API (max 500 requests/second)
@@ -273,22 +261,40 @@ class ezIBAsync:
                 
             except Exception as e:
                 self._logger.error(f"Error requesting market data for {contract.symbol}: {e}")
-    
-    def cancelMarketData(self, contracts=None):
+    # ---------------------------------------
+    def requestMarketDepth(self, contracts=None, num_rows=10):
+        
+        if num_rows > 10:
+            num_rows = 10
+
+        if contracts == None:
+            contracts = self.contracts
+        elif not isinstance(contracts, list):
+            contracts = [contracts]
+
+        for contract in contracts:
+            contractSring = self.contractString(contract)
+            self._logger.info(f"Requesting market depth for {contract.symbol} ({contractSring})")
+
+            ticker = self.ib.reqMktDepth(contract, numRows=num_rows)
+            # ticker.updateEvent += self._handle_orderbook_update
+
+    # ---------------------------------------
+    def cancelMarketDepth(self, contracts=None):
         """
-        Cancel streaming market data for contracts.
+        Cancel streaming market depth for contracts.
         
         Args:
-            contracts: Contract or list of contracts to cancel market data for.
+            contracts: Contract or list of contracts to cancel market depth for.
                       If None, cancels for all contracts in self.contracts.
         """
-        if not self.isConnected:
+        if not self.connected:
             self._logger.info("Not connected to IB")
             return
             
         # Use all contracts if none specified
         if contracts is None:
-            contracts = list(self.contracts.values())
+            contracts = self.contracts
         elif not isinstance(contracts, list):
             contracts = [contracts]
             
@@ -297,9 +303,49 @@ class ezIBAsync:
                 # Skip multi-contracts
                 if self.isMultiContract(contract):
                     continue
+                
+                contractString = self.contractString(contract)
                     
                 # Cancel market data
-                self._logger.info(f"Canceling market data for {contract.symbol} (ID: {id(contract)})")
+                self._logger.info(f"Canceling depth market data for {contract.symbol} ({contractString})")
+                self.ib.cancelMktDepth(contract)
+                
+            except Exception as e:
+                self._logger.error(f"Canceling depth market data for {contract.symbol}: {e}")
+            
+    def _handle_orderbook_update(self, ticker):
+        self._logger.debug(f"Orderbook {ticker} received")
+        self.updateMarketDepthEvent.emit(ticker)
+            
+    # ---------------------------------------
+    def cancelMarketData(self, contracts=None):
+        """
+        Cancel streaming market data for contracts.
+        
+        Args:
+            contracts: Contract or list of contracts to cancel market data for.
+                      If None, cancels for all contracts in self.contracts.
+        """
+        if not self.connected:
+            self._logger.info("Not connected to IB")
+            return
+            
+        # Use all contracts if none specified
+        if contracts is None:
+            contracts = self.contracts
+        elif not isinstance(contracts, list):
+            contracts = [contracts]
+            
+        for contract in contracts:
+            try:
+                # Skip multi-contracts
+                if self.isMultiContract(contract):
+                    continue
+                
+                contractString = self.contractString(contract)
+                    
+                # Cancel market data
+                self._logger.info(f"Canceling market data for {contract.symbol} ({contractString})")
                 self.ib.cancelMktData(contract)
                 
             except Exception as e:
@@ -321,8 +367,16 @@ class ezIBAsync:
 
         market_tickers = []
         options_tickers = []
+        market_depth_tickers = []
 
         for t in tickers:
+            
+            if t.domAsks:
+                market_depth_tickers.append(t)
+            
+            if t.domBids:
+                market_depth_tickers.append(t)
+                
             if t.contract.secType in ("OPT", "FOP"):
                 options_tickers.append(t)
             else:
@@ -394,6 +448,8 @@ class ezIBAsync:
             self.pendingMarketTickersEvent.emit(market_tickers)
         if options_tickers:
             self.pendingOptionsTickersEvent.emit(options_tickers)
+        if market_depth_tickers:
+            self.updateMarketDepthEvent.emit(market_depth_tickers)
             
             # except Exception as e:
             #     self._logger.error(f"Error handling ticker update for {contract.symbol if hasattr(contract, 'symbol') else 'unknown'}: {e}")
@@ -411,34 +467,35 @@ class ezIBAsync:
         try:        
             # Create account entry if it doesn't exist
             if value.account not in self._accounts:
-                self._accounts[value.account] = {}
+                self._accounts[value.account] = []
                 
             # Set value
-            self._accounts[value.account][value.tag] = value.value
+            # self._accounts[value.account][value.tag] = value.value
+            self._accounts[value.account].append(value)
             # self._logger.debug(f"Account value update: {value.account} - {value.tag}: {value.value}")
             
         except Exception as e:
             self._logger.error(f"Error handling account value update: {e}")
 
     # ---------------------------------------
-    def _on_account_summary(self, summary):
-        """
-        Handle account summary updates from IB.
+    # def _on_account_summary(self, summary):
+    #     """
+    #     Handle account summary updates from IB.
         
-        Args:
-            summary: AccountSummary object from IB
-        """
-        try:         
-            # Create account entry if it doesn't exist
-            if summary.account not in self._accounts:
-                self._accounts[summary.account] = {}
+    #     Args:
+    #         summary: AccountSummary object from IB
+    #     """
+    #     try:         
+    #         # Create account entry if it doesn't exist
+    #         if summary.account not in self._accounts:
+    #             self._accounts[summary.account] = []
                 
-            # Set value
-            self._accounts[summary.account][summary.tag] = value
-            self._logger.debug(f"Account summary update: {summary.account} - {summary.tag}: {summary.value}")
+    #         # Set value
+    #         self._accounts[summary.account].append(summary)
+    #         self._logger.debug(f"Account summary update: {summary.account} - {summary.tag}: {summary.value}")
             
-        except Exception as e:
-            self._logger.error(f"Error handling account summary update: {e}")
+    #     except Exception as e:
+    #         self._logger.error(f"Error handling account summary update: {e}")
 
     # ---------------------------------------
     @property
@@ -470,7 +527,7 @@ class ezIBAsync:
         Disconnection event handler for Interactive Brokers TWS/Gateway.
         
         """
-        self.isConnected = False
+        self.connected = False
 
         if not self._disconnected_by_user:
             self._logger.warning("Disconnected from IB")
@@ -482,7 +539,7 @@ class ezIBAsync:
         
         """
         attempt = 0
-        while not self.isConnected and attempt < max_attempts and not self._disconnected_by_user:
+        while not self.connected and attempt < max_attempts and not self._disconnected_by_user:
             attempt += 1
             self._logger.info(f"Reconnection attempt {attempt}/{max_attempts}...")
             
@@ -490,13 +547,13 @@ class ezIBAsync:
                 await asyncio.sleep(reconnect_interval)
                 await self.connectAsync(ibhost=self._ibhost, ibport=self._ibport, ibclient=self._ibclient)
                 
-                if self.isConnected:
+                if self.connected:
                     self._logger.info("Reconnection successful")
                     break
             except Exception as e:
                 self._logger.error(f"Reconnection failed: {e}")
                 
-        if not self.isConnected and attempt >= max_attempts:
+        if not self.connected and attempt >= max_attempts:
             self._logger.error(f"Failed to reconnect after {max_attempts} attempts, giving up")
 
     # ---------------------------------------
@@ -515,10 +572,11 @@ class ezIBAsync:
             
             # disconnect
             self._disconnected_by_user = True
-            if self.isConnected:
+            if self.connected:
+                self.ib.client.reqAccountUpdates(False, self._default_account)
                 self._logger.info("Disconnecting from IB")
                 self.ib.disconnect()
-                self.isConnected = False
+                self.connected = False
                 self._logger.info("Disconnected.")
         except Exception as e:
             self._logger.error(f"Error during disconnection: {str(e)}")
@@ -738,60 +796,57 @@ class ezIBAsync:
         }
 
     # ---------------------------------------
-    async def createContract(self, contract_identifier, **kwargs):
+    async def createContract(self, *args, **kwargs):
         """
-        Create a contract from a tuple representation.
+        Create a contract from a tuple representation or parameters.
         
         Args:
-            contractTuple: Tuple representation of the contract
+            *args: Contract parameters (symbol, sec_type, exchange, currency, lastTradeDateOrContractMonth, strike, right)
             **kwargs: Additional contract parameters
             
         Returns:
             Created contract object
         """
-        if self.getConId(contract_identifier):
-            self._logger.debug(f"The contract: {contract_identifier} has been registered.")
-            return self.contracts[self.tickerId(contract_identifier)]
-        print('create new contract')
-        if isinstance(contract_identifier, tuple):
+        if len(args) == 1 and isinstance(args[0], Contract):
+            newContract = args[0]
+        else:
             # Create a new Contract object
             newContract = Contract()
-            newContract.symbol = contract_identifier[0]
-            newContract.secType = contract_identifier[1]
-            newContract.exchange = contract_identifier[2] or "SMART"
-            newContract.currency = contract_identifier[3] or "USD"
-            newContract.lastTradeDateOrContractMonth = contract_identifier[4] or ""
-            newContract.strike = contract_identifier[5] or 0.0
-            newContract.right = contract_identifier[6] or ""
+            newContract.symbol = args[0]
+            newContract.secType = args[1]
+            newContract.exchange = args[2] or "SMART"
+            newContract.currency = args[3] or "USD"
+            newContract.lastTradeDateOrContractMonth = args[4] or ""
+            newContract.strike = args[5] or 0.0
+            newContract.right = args[6] or ""
             
-            if len(contract_identifier) >= 8:
-                newContract.multiplier = contract_identifier[7]
+            if len(args) >= 8:
+                newContract.multiplier = args[7]
                 
             # Include expired contracts for historical data
             newContract.includeExpired = newContract.secType in ("FUT", "OPT", "FOP")
-
-        elif isinstance(contract_identifier, Contract):
-            newContract = contract_identifier
-        # Add combo legs if provided
-        # if "combo_legs" in kwargs:
-        #     newContract.comboLegs = kwargs["combo_legs"]
-        
+        if "combo_legs" in kwargs:
+            newContract.comboLegs = kwargs["combo_legs"]
+            
         # qualify this contract
         qualified_contracts = await self.ib.qualifyContractsAsync(newContract)
-        
-        if "combo_legs" in kwargs:
-            qualified_contracts.comboLegs = kwargs["combo_legs"]
         
         qualified_contract = qualified_contracts[0] if qualified_contracts else None
         if not qualified_contract:
             self._logger.warning(f'Unknown contract: {newContract}')
             return
 
-        contractString = self.contractString(qualified_contract)
-        tickerId = self.tickerId(contractString)
+        # contractString = self.contractString(qualified_contract)
+        # tickerId = self.tickerId(contractString)
+        
+        contract = self.getContract(qualified_contract)
+        
+        if contract:
+            self._logger.debug(f"Contract: {qualified_contract} has been registered.")
+            return contract
 
         # Add contract to pool
-        self.contracts[tickerId] = qualified_contract
+        self.contracts.append(qualified_contract)
 
         # Request contract details if not a combo contract
         if "combo_legs" not in kwargs:
@@ -809,8 +864,8 @@ class ezIBAsync:
         Create a stock contract.
 
         """
-        contract_tuple = (symbol, "STK", exchange, currency, "", 0.0, "")
-        return await self.createContract(contract_tuple)
+        contract = Stock(symbol=symbol, exchange=exchange, currency=currency)
+        return await self.createContract(contract)
     
     # -----------------------------------------
     async def createFuturesContract(self, symbol, currency = "USD", expiry = None, exchange = "CME", multiplier = ""):
@@ -835,20 +890,21 @@ class ezIBAsync:
         expiries = [expiry] if expiry and not isinstance(expiry, list) else expiry
         
         if not expiries:
-            contract_tuple = (symbol, "FUT", exchange, currency, "", 0.0, "", multiplier)
-            return await self.createContract(contract_tuple)
+            contract = Future(symbol=symbol, exchange=exchange, currency=currency, multiplier=multiplier)
+            return await self.createContract(contract)
             
         contracts = []
         for fut_expiry in expiries:
-            contract_tuple = (symbol, "FUT", exchange, currency, fut_expiry, 0.0, "", multiplier)
-            contract = await self.createContract(contract_tuple)
+            contract = Future(symbol=symbol, lastTradeDateOrContractMonth=fut_expiry, 
+                             exchange=exchange, currency=currency, multiplier=multiplier)
+            contract = await self.createContract(contract)
             contracts.append(contract)
             
         return contracts[0] if len(contracts) == 1 else contracts
 
     # -----------------------------------------
     async def createContinuousFuturesContract(self, symbol, exchange = "GLOBEX",
-                                              output = "contract", is_retry = False):
+                                          output = "contract", is_retry = False):
         """
         Create a continuous futures contract.
         
@@ -862,7 +918,11 @@ class ezIBAsync:
             Futures contract object or tuple
         """
         # Create a continuous futures contract
-        contfut_contract = await self.createContract((symbol, "CONTFUT", exchange, "", "", "", ""))
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = "CONTFUT"
+        contract.exchange = exchange
+        contfut_contract = await self.createContract(contract)
         
         # Wait for contract details
         for _ in range(25):
@@ -898,7 +958,7 @@ class ezIBAsync:
 
     # -----------------------------------------
     async def createOptionContract(self, symbol, expiry = None, strike = 0.0, otype = "C",
-                                  currency = "USD", sec_type = "OPT", exchange = "SMART"):
+                                  currency = "USD", sec_type = "OPT", exchange = "SMART", multiplier=""):
         """
         Create an option contract.
         
@@ -923,8 +983,13 @@ class ezIBAsync:
         for opt_expiry in expiries or [""]:
             for opt_strike in strikes or [0.0]:
                 for opt_otype in otypes or ["C"]:
-                    contract_tuple = (symbol, sec_type, exchange, currency, opt_expiry, opt_strike, opt_otype)
-                    contract = await self.createContract(contract_tuple)
+                    contract = Option(symbol=symbol, lastTradeDateOrContractMonth=opt_expiry,
+                                     strike=opt_strike, right=opt_otype, exchange=exchange,
+                                     multiplier=multiplier, currency=currency)
+                    # Override secType if needed (for FOP)
+                    if sec_type != "OPT":
+                        contract.secType = sec_type
+                    contract = await self.createContract(contract)
                     contracts.append(contract)
                     
         return contracts[0] if len(contracts) == 1 else contracts
@@ -941,8 +1006,8 @@ class ezIBAsync:
         Returns:
             Forex contract object
         """
-        contract_tuple = (symbol, "CASH", exchange, currency, "", 0.0, "")
-        return await self.createContract(contract_tuple)
+        contract = Forex(pair=f'{symbol}{currency}', symbol=symbol, currency=currency, exchange=exchange)
+        return await self.createContract(contract)
         
     async def createIndexContract(self, symbol, currency = "USD", exchange = "CBOE"):
         """
@@ -956,8 +1021,8 @@ class ezIBAsync:
         Returns:
             Index contract object
         """
-        contract_tuple = (symbol, "IND", exchange, currency, "", 0.0, "")
-        return await self.createContract(contract_tuple)
+        contract = Index(symbol=symbol, exchange=exchange, currency=currency)
+        return await self.createContract(contract)
         
     async def createComboLeg(self, contract, action, ratio = 1, exchange = None):
         """
@@ -1006,8 +1071,13 @@ class ezIBAsync:
             Combo contract object
         """
         exchange = legs[0].exchange if exchange is None else exchange
-        contract_tuple = (symbol, "BAG", exchange, currency, "", 0.0, "")
-        return await self.createContract(contract_tuple, combo_legs=legs)
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = "BAG"
+        contract.exchange = exchange
+        contract.currency = currency
+        contract.comboLegs = legs
+        return await self.createContract(contract)
 
     # ---------------------------------------
     def createOrder(self, quantity, price=0., stop=0., tif="DAY",
@@ -1161,8 +1231,9 @@ class ezIBAsync:
                 self._logger.warning(f"No contract details returned for {contract}")
                 return
                 
+            self._contract_details.append(*details)
             # Process contract details
-            await self._handle_contract_details(tickerId, details)
+            # await self._handle_contract_details(tickerId, details)
             
         except Exception as e:
             self._logger.error(f"Error requesting contract details: {e}")
@@ -1239,7 +1310,7 @@ class ezIBAsync:
                 self._contract_details[contract_ticker_id] = contract_details
 
     # -----------------------------------------
-    def getConId(self, contract_identifier):
+    def getConId(self, contract):
         """
         Get the contract ID for a contract, symbol, or ticker ID.
         
@@ -1249,8 +1320,31 @@ class ezIBAsync:
         Returns:
             Contract ID
         """
-        details = self.contractDetails(contract_identifier)
-        return details.get("conId", 0)
+        for c in self.contracts:
+            if contract.conId == c.conId:
+                return c.conId
+        
+        return 0
+
+        # details = self.contractDetails(contract_identifier)
+        # return details.get("conId", 0)
+    
+    # -----------------------------------------
+    def getContract(self, contract):
+        """
+        Get the contract ID for a contract, symbol, or ticker ID.
+        
+        Args:
+            contract_identifier: Contract object, symbol string, or ticker ID
+            
+        Returns:
+            Contract ID
+        """
+        for c in self.contracts:
+            if contract.conId == c.conId:
+                return c
+        
+        return None
 
     # -----------------------------------------
     def isMultiContract(self, contract):
@@ -1350,8 +1444,7 @@ class ezIBAsync:
         
         Args:
             contract: Contract object to register
-        """ 
-        
+        """
         try:
             if self.getConId(contract) == 0:
                 # contract_tuple = self.contract_to_tuple(contract)
@@ -1365,11 +1458,6 @@ class ezIBAsync:
         except Exception as e:
             self._logger.error(f"Error registering contract: {str(e)}")
     
-        # if self.getConId(contract) == 0:
-        #     self._logger.info(f'Received a new contract: {contract.symbol} that is not registered!')
-        #     contract_tuple = self.contract_to_tuple(contract)
-        #     await self.createContract(contract_tuple)
-
     # -----------------------------------------
     # Position handling
     # -----------------------------------------
@@ -1377,6 +1465,8 @@ class ezIBAsync:
         """
         Handle position updates from IB.
         
+        Args:
+            position: Position object from IB
         """
         try:
             # contract identifier
@@ -1394,14 +1484,14 @@ class ezIBAsync:
             if position.account not in self._positions:
                 self._positions[position.account] = {}
                 
-            # Create or update position
-            self._positions[position.account][contractString] = {
-                "symbol": contractString,
-                "position": position.position,
-                "avgCost": position.avgCost,
-                "account": position.account
-            }
-            
+            # If position is zero, remove the position entry
+            # if position.position == 0:
+            #     if contractString in self._positions[position.account]:
+            #         del self._positions[position.account][contractString]
+            #         self._logger.debug(f"Removed position for {position.account}: {symbol} (position closed)")
+            # else:
+            # Update position
+            self._positions[position.account][contractString] = position
             self._logger.debug(
                 f"Updated position for {position.account}: {symbol} = {position.position} @ {position.avgCost}")
             
@@ -1411,11 +1501,19 @@ class ezIBAsync:
         # TODO:fire callback
         # self.ibCallback(caller="handlePosition", msg=position)
 
+    # @property
+    # def positions(self):
+    #     return self.getPositions()
+    
     @property
     def positions(self):
-        return self.getPositions()
+        return self._positions
+    
+    @property
+    def position(self):
+        return self.getPosition()
 
-    def getPositions(self, account=None):
+    def getPosition(self, account=None):
         if len(self._positions) == 0:
             return {}
 
@@ -1438,6 +1536,8 @@ class ezIBAsync:
         """
         Handle portfolio updates from IB.
         
+        Args:
+            portfolio: Portfolio object from IB
         """
         try:
             # contract identifier
@@ -1453,24 +1553,25 @@ class ezIBAsync:
             # Create account entry if it doesn't exist
             if portfolio.account not in self._portfolios:
                 self._portfolios[portfolio.account] = {}
-                self._portfolios_items[portfolio.account] = []
+                # self._portfolios_items[portfolio.account] = []
                 
             # Calculate total P&L
-            total_pnl = portfolio.unrealizedPNL + portfolio.realizedPNL
+            # total_pnl = portfolio.unrealizedPNL + portfolio.realizedPNL
             
             # Create or update portfolio item
-            self._portfolios[portfolio.account][contractString] = {
-                "symbol": contractString,
-                "position": portfolio.position,
-                "marketPrice": portfolio.marketPrice,
-                "marketValue": portfolio.marketValue,
-                "averageCost": portfolio.averageCost,
-                "unrealizedPNL": portfolio.unrealizedPNL,
-                "realizedPNL": portfolio.realizedPNL,
-                "totalPNL": total_pnl,
-                "account": portfolio.account
-            }
-            self._portfolios_items[portfolio.account].append(portfolio)
+            self._portfolios[portfolio.account][contractString] = portfolio
+            # self._portfolios[portfolio.account][contractString] = {
+            #     "symbol": contractString,
+            #     "position": portfolio.position,
+            #     "marketPrice": portfolio.marketPrice,
+            #     "marketValue": portfolio.marketValue,
+            #     "averageCost": portfolio.averageCost,
+            #     "unrealizedPNL": portfolio.unrealizedPNL,
+            #     "realizedPNL": portfolio.realizedPNL,
+            #     "totalPNL": total_pnl,
+            #     "account": portfolio.account
+            # }
+            # self._portfolios_items[portfolio.account].append(portfolio)
             
             self._logger.debug(
                 f"Updated portfolio for {portfolio.account}: {symbol} = {portfolio.position} @ {portfolio.marketPrice}")
@@ -1483,12 +1584,13 @@ class ezIBAsync:
 
     @property
     def portfolios(self):
-        return self.ib.portfolio()
+        return self._portfolios
     
 
     @property
     def portfolio(self):
-        return [ p for p in self.portfolios if p.account == self._default_account]
+        return self.getPortfolio()
+        # return [ p for p in self.portfolios if p.account == self._default_account]
 
     def getPortfolio(self, account=None):
         if len(self._portfolios) == 0:
