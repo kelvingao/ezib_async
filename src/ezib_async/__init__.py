@@ -36,7 +36,6 @@ from .mappings import *
 __all__ = [
     "ezIBAsync",
     "util",
-    "BASE_FIELD_MAPPING",
     "__version__",
 ]
 

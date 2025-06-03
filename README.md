@@ -57,4 +57,4 @@ if __name__ == "__main__":
 
 ## License
 
-MIT License
+[MIT License](LICENSE)

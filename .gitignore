@@ -18,7 +18,6 @@ build/
 env/
 venv/
 ENV/
-.python-version
 
 # Unit test / coverage reports
 htmlcov/

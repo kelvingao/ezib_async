@@ -2,6 +2,8 @@
 # --------------
 # https://interactivebrokers.github.io/tws-api/historical_bars.html
 # https://interactivebrokers.github.io/tws-api/tick_types.html
+# https://www.interactivebrokers.com/campus/ibkr-api-page/twsapi-doc/#historical-bars
+# https://www.interactivebrokers.com/campus/ibkr-api-page/twsapi-doc/#available-tick-types
 import logging
 
 from ib_async import Contract, Order
