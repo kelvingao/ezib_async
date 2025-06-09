@@ -51,7 +51,8 @@ class ezIBAsync:
     
     events = (
         "pendingMarketTickersEvent",
-        "pendingOptionsTickersEvent"
+        "pendingOptionsTickersEvent",
+        "updateMarketDepthEvent"
     )
     
     @staticmethod
@@ -150,13 +151,13 @@ class ezIBAsync:
         self.connected = False
         self._disconnected_by_user = False
 
-        self._register_events_handlers()
+        self._setup_handlers()
 
     def _createEvents(self):
 
         self.pendingMarketTickersEvent = Event("pendingMarketTickersEvent")
         self.pendingOptionsTickersEvent = Event("pendingOptionsTickersEvent")
-        self.updateMarketDepthEvent = Event("upadteMarketDepthEvent")
+        self.updateMarketDepthEvent = Event("updateMarketDepthEvent")
 
     # ---------------------------------------
     async def connectAsync(self, ibhost=None, ibport=None, 
@@ -206,22 +207,23 @@ class ezIBAsync:
             return False
 
     # ---------------------------------------
-    def _register_events_handlers(self):
+    def _setup_handlers(self):
         """
         Registers event handlers for the Interactive Brokers TWS/Gateway connection.
         
         """
         if self.ib is not None:
             # disconnection handler
-            self.ib.disconnectedEvent += self._on_disconnected
+            self.ib.disconnectedEvent += self._onDisconnectedHandler
 
             # accounts info handlers
-            self.ib.accountValueEvent += self._on_account_value
-            self.ib.positionEvent += self._on_position_update
-            self.ib.updatePortfolioEvent += self._on_portfolio_update
+            self.ib.accountValueEvent += self._onAccountValueHandler
+            self.ib.accountSummaryEvent += self._onAccountSummaryHandler
+            self.ib.positionEvent += self._onPositionUpdateHandler
+            self.ib.updatePortfolioEvent += self._onPortfolioUpdateHandler
 
-            # tickers handler
-            self.ib.pendingTickersEvent += self._on_pending_tickers
+            # market / options / depth data handler
+            self.ib.pendingTickersEvent += self._onPendingTickersHandler
 
     # ---------------------------------------
     async def requestMarketData(self, contracts=None, snapshot=False):
@@ -354,7 +356,7 @@ class ezIBAsync:
     # -----------------------------------------
     # Market data event handlers
     # -----------------------------------------
-    def _on_pending_tickers(self, tickers):
+    def _onPendingTickersHandler(self, tickers):
         """
         Handle consolidated ticker updates from IB.
         
@@ -457,7 +459,7 @@ class ezIBAsync:
     # ---------------------------------------
     # Accounts handling
     # ---------------------------------------
-    def _on_account_value(self, value):
+    def _onAccountValueHandler(self, value):
         """
         Handle account value updates from IB.
         
@@ -467,35 +469,34 @@ class ezIBAsync:
         try:        
             # Create account entry if it doesn't exist
             if value.account not in self._accounts:
-                self._accounts[value.account] = []
+                self._accounts[value.account] = {}
                 
             # Set value
-            # self._accounts[value.account][value.tag] = value.value
-            self._accounts[value.account].append(value)
+            self._accounts[value.account][value.tag] = value.value
             # self._logger.debug(f"Account value update: {value.account} - {value.tag}: {value.value}")
             
         except Exception as e:
             self._logger.error(f"Error handling account value update: {e}")
 
     # ---------------------------------------
-    # def _on_account_summary(self, summary):
-    #     """
-    #     Handle account summary updates from IB.
+    def _onAccountSummaryHandler(self, summary):
+        """
+        Handle account summary updates from IB.
         
-    #     Args:
-    #         summary: AccountSummary object from IB
-    #     """
-    #     try:         
-    #         # Create account entry if it doesn't exist
-    #         if summary.account not in self._accounts:
-    #             self._accounts[summary.account] = []
+        Args:
+            summary: AccountSummary object from IB
+        """
+        try:         
+            # Create account entry if it doesn't exist
+            if summary.account not in self._accounts_summary:
+                self._accounts_summary[summary.account] = []
                 
-    #         # Set value
-    #         self._accounts[summary.account].append(summary)
-    #         self._logger.debug(f"Account summary update: {summary.account} - {summary.tag}: {summary.value}")
+            # Set value
+            self._accounts_summary[summary.account].append(summary)
+            self._logger.debug(f"Account summary update: {summary.account} - {summary.tag}: {summary.value}")
             
-    #     except Exception as e:
-    #         self._logger.error(f"Error handling account summary update: {e}")
+        except Exception as e:
+            self._logger.error(f"Error handling account summary update: {e}")
 
     # ---------------------------------------
     @property
@@ -505,6 +506,14 @@ class ezIBAsync:
         
         """
         return self._accounts
+
+    @property
+    def accountsSummary(self):
+        """
+        Get all account summary information.
+        
+        """
+        return self._accounts_summary
 
     @property
     def account(self):
@@ -522,7 +531,7 @@ class ezIBAsync:
         return list(self._accounts.keys())
 
     # ---------------------------------------
-    def _on_disconnected(self):
+    def _onDisconnectedHandler(self):
         """
         Disconnection event handler for Interactive Brokers TWS/Gateway.
         
@@ -1461,7 +1470,7 @@ class ezIBAsync:
     # -----------------------------------------
     # Position handling
     # -----------------------------------------
-    def _on_position_update(self, position):
+    def _onPositionUpdateHandler(self, position):
         """
         Handle position updates from IB.
         
@@ -1484,6 +1493,14 @@ class ezIBAsync:
             if position.account not in self._positions:
                 self._positions[position.account] = {}
                 
+            # Create or update position
+            self._positions[position.account][contractString] = {
+                "symbol": contractString,
+                "position": position.position,
+                "avgCost": position.avgCost,
+                "account": position.account
+            }
+                
             # If position is zero, remove the position entry
             # if position.position == 0:
             #     if contractString in self._positions[position.account]:
@@ -1491,7 +1508,7 @@ class ezIBAsync:
             #         self._logger.debug(f"Removed position for {position.account}: {symbol} (position closed)")
             # else:
             # Update position
-            self._positions[position.account][contractString] = position
+            # self._positions[position.account][contractString] = position
             self._logger.debug(
                 f"Updated position for {position.account}: {symbol} = {position.position} @ {position.avgCost}")
             
@@ -1532,12 +1549,12 @@ class ezIBAsync:
     # -----------------------------------------
     # Portfolio handling
     # -----------------------------------------
-    def _on_portfolio_update(self, portfolio):
+    def _onPortfolioUpdateHandler(self, portfolio):
         """
         Handle portfolio updates from IB.
         
         Args:
-            portfolio: Portfolio object from IB
+            portfolio: PortfolioItem objects from IB
         """
         try:
             # contract identifier
@@ -1556,21 +1573,21 @@ class ezIBAsync:
                 # self._portfolios_items[portfolio.account] = []
                 
             # Calculate total P&L
-            # total_pnl = portfolio.unrealizedPNL + portfolio.realizedPNL
+            total_pnl = portfolio.unrealizedPNL + portfolio.realizedPNL
             
             # Create or update portfolio item
-            self._portfolios[portfolio.account][contractString] = portfolio
-            # self._portfolios[portfolio.account][contractString] = {
-            #     "symbol": contractString,
-            #     "position": portfolio.position,
-            #     "marketPrice": portfolio.marketPrice,
-            #     "marketValue": portfolio.marketValue,
-            #     "averageCost": portfolio.averageCost,
-            #     "unrealizedPNL": portfolio.unrealizedPNL,
-            #     "realizedPNL": portfolio.realizedPNL,
-            #     "totalPNL": total_pnl,
-            #     "account": portfolio.account
-            # }
+            # self._portfolios[portfolio.account][contractString] = portfolio
+            self._portfolios[portfolio.account][contractString] = {
+                "symbol": contractString,
+                "position": portfolio.position,
+                "marketPrice": portfolio.marketPrice,
+                "marketValue": portfolio.marketValue,
+                "averageCost": portfolio.averageCost,
+                "unrealizedPNL": portfolio.unrealizedPNL,
+                "realizedPNL": portfolio.realizedPNL,
+                "totalPNL": total_pnl,
+                "account": portfolio.account
+            }
             # self._portfolios_items[portfolio.account].append(portfolio)
             
             self._logger.debug(
