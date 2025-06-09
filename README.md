@@ -32,10 +32,10 @@ uv pip install ezib-async
 
 ```python
 import asyncio
-from ezib_async import ezIBpyAsync
+from ezib_async import ezIBAsync
 
 async def main():
-    ezib = ezIBpyAsync()
+    ezib = ezIBAsync()
     await ezib.connectAsync(ibhost='127.0.0.1', ibport=4001, ibclient=0)
     
     # Create contracts
@@ -62,10 +62,10 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from ezib_async import ezIBpyAsync
+from ezib_async import ezIBAsync
 
 async def main():
-    ezib = ezIBpyAsync()
+    ezib = ezIBAsync()
     await ezib.connectAsync(ibhost='127.0.0.1', ibport=4001, ibclient=0)
     
     # Create contract
@@ -94,10 +94,10 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from ezib_async import ezIBpyAsync
+from ezib_async import ezIBAsync
 
 async def main():
-    ezib = ezIBpyAsync()
+    ezib = ezIBAsync()
     await ezib.connectAsync(ibhost='127.0.0.1', ibport=4001, ibclient=0)
     
     # Create contract
@@ -129,10 +129,10 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from ezib_async import ezIBpyAsync
+from ezib_async import ezIBAsync
 
 async def main():
-    ezib = ezIBpyAsync()
+    ezib = ezIBAsync()
     await ezib.connectAsync(ibhost='127.0.0.1', ibport=4001, ibclient=0)
     
     # Create contract
@@ -177,7 +177,7 @@ import ezib_async
 logging.getLogger('ezib_async').setLevel(logging.INFO)
 
 # Initialize
-ezib = ezib_async.ezIBpyAsync()
+ezib = ezib_async.ezIBAsync()
 ```
 
 ## Requirements
