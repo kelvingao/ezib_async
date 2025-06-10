@@ -39,11 +39,17 @@ async def main():
     await ezib.connectAsync(ibhost='127.0.0.1', ibport=4001, ibclient=0)
     
     # Create contracts
-    stk_contract = await ezib.createStockContract("AAPL")
-    fut_contract = await ezib.createFuturesContract("ES", expiry="202512")
+    contracts = await asyncio.gather(
+        ezib.createStockContract("NVDA"),
+        ezib.createOptionContract("AAPL", expiry="20251219", strike=200, otype="P"),
+        ezib.createOptionContract("AAPL", expiry="20251219", strike=200, otype="C"),
+        ezib.createFuturesContract("ES", expiry="202512", exchange="CME"),
+        ezib.createContract("CL", "FUT", "NYMEX", "USD", "202512", 0.0, ""),
+        ezib.createForexContract("EUR", currency="USD")
+    )
     
     # Request market data
-    await ezib.requestMarketData()
+    await ezib.requestMarketData(contracts)
     
     # Wait for data
     await asyncio.sleep(10)
@@ -52,7 +58,7 @@ async def main():
     print(ezib.marketData)
     
     # Cancel market data request and disconnect
-    await ezib.cancelMarketData()
+    ezib.cancelMarketData(contracts)
     ezib.disconnect()
 
 asyncio.run(main())
