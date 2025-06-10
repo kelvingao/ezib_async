@@ -30,7 +30,6 @@ SOFTWARE.
 
 from .version import __version__
 from .ezib import ezIBAsync
-from .mappings import *
 
 # export main classes for easy import
 __all__ = [
