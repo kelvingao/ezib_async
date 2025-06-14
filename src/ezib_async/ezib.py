@@ -105,6 +105,7 @@ class ezIBAsync:
 
         # accounts
         self._accounts: Dict[str, List[AccountValue]] = {}  # accountId -> accountValues
+        self._accounts_summary = {}  # accountId -> accountSummary
         self._positions: Dict[str, Dict[str, Position]] = {}
         self._portfolios: Dict[str, Dict[str, PortfolioItem]] = {}  # accountId -> contractString -> portfolioItem
         self._contract_details: List[dict] = []  # multiple expiry/strike/side contracts
@@ -383,68 +384,48 @@ class ezIBAsync:
                 options_tickers.append(t)
             else:
                 market_tickers.append(t)
-                # contract = t.contract
-                # symbol = self.contractString(contract)
-                # ticker_id = self.tickerId(symbol)
 
-                # is_option = contract.secType in ("OPT", "FOP")
-                # df2use = self.optionsData if is_option else self.marketData
+            contract = t.contract
+            symbol = self.contractString(contract)
+            ticker_id = self.tickerId(symbol)
 
-                # # Ensure the ticker exists in our data structure
-                # if ticker_id not in df2use:
-                #     df2use[ticker_id] = df2use[0].copy()
-                    
-                # # Update common market data fields
-                # for field, attr in COMMON_FIELD_MAPPING.items():
-                #     if field == "datetime":
-                #         df2use[ticker_id].index = [getattr(t, attr)]
-                #     else:
-                #         df2use[ticker_id][field] = getattr(t, attr)
+            is_option = contract.secType in ("OPT", "FOP")
+            df2use = self.optionsData if is_option else self.marketData
 
-                # if is_option:
+            # Ensure the ticker exists in our data structure
+            if ticker_id not in df2use:
+                df2use[ticker_id] = df2use[0].copy()
+                
+            # Update common market data fields
+            df2use[ticker_id].index = [t.time]
+            df2use[ticker_id]["bid"] = t.bid
+            df2use[ticker_id]["bidsize"] = t.bidSize
+            df2use[ticker_id]["ask"] = t.ask
+            df2use[ticker_id]["asksize"] = t.askSize
+            df2use[ticker_id]["last"] = t.last
+            df2use[ticker_id]["lastsize"] = t.lastSize
+            df2use[ticker_id]["volume"] = t.volume
 
-                #     # Handle open interest field based on contract type
-                #     if contract.secType == "OPT":
-                #         if contract.right == "C" and hasattr(t, "callOpenInterest"):
-                #             df2use[ticker_id]['oi'] = t.callOpenInterest
-                #         elif contract.right == "P" and hasattr(t, "putOpenInterest"):
-                #             df2use[ticker_id]['oi'] = t.putOpenInterest
-                #     elif contract.secType == "FOP" and hasattr(t, "futuresOpenInterest"):
-                #         df2use[ticker_id]['oi'] = t.futuresOpenInterest
-                    
-                #     # Handle implied volatility - prioritize impliedVolatility if available
-                #     if hasattr(t, "impliedVolatility") and t.impliedVolatility is not None and t.impliedVolatility < 1e6:
-                #         df2use[ticker_id]['iv'] = t.impliedVolatility
-                #     elif hasattr(t, "lastGreeks") and hasattr(t.lastGreeks, "impliedVol") and t.lastGreeks.impliedVol is not None:
-                #         df2use[ticker_id]['iv'] = t.lastGreeks.impliedVol
-                                    
-                #     if t.modelGreeks:
-                #         for key, attr in OPT_FOP_MODELGREEKS_MAPPING.items():
-                #             if hasattr(t.modelGreeks, attr):
-                #                 val = getattr(t.modelGreeks, attr)
-                #                 if val and val < 1e6:
-                #                     df2use[ticker_id][key] = val
-                    
-                #     if t.lastGreeks:
-                #         for key, attr in OPT_FOP_LASTGREEKS_MAPPING.items():
-                #             if hasattr(t.lastGreeks, attr):
-                #                 val = getattr(t.lastGreeks, attr)
-                #                 if val and val < 1e6:
-                #                     df2use[ticker_id][key] = val
-                    
-                #     if t.bidGreeks:
-                #         for key, attr in OPT_FOP_BIDGREEKS_MAPPING.items():
-                #             if hasattr(t.bidGreeks, attr):
-                #                 val = getattr(t.bidGreeks, attr)
-                #                 if val and val < 1e6:
-                #                     df2use[ticker_id][key] = val
+            if is_option:
 
-                #     if t.askGreeks:
-                #         for key, attr in OPT_FOP_ASKGREEKS_MAPPING.items():
-                #             if hasattr(t.askGreeks, attr):
-                #                 val = getattr(t.askGreeks, attr)
-                #                 if val and val < 1e6:
-                #                     df2use[ticker_id][key] = val
+                # Handle open interest field based on contract type
+                if contract.right == "C" and hasattr(t, "callOpenInterest"):
+                    df2use[ticker_id]['oi'] = t.callOpenInterest
+                elif contract.right == "P" and hasattr(t, "putOpenInterest"):
+                    df2use[ticker_id]['oi'] = t.putOpenInterest
+                
+                # Handle implied volatility - prioritize impliedVolatility if available
+                df2use[ticker_id]['iv'] = t.impliedVolatility
+                                
+                
+                if t.lastGreeks:
+                    self._handleTickOptionComputation(ticker_id, t.lastGreeks, "last_")
+                
+                if t.bidGreeks:
+                    self._handleTickOptionComputation(ticker_id, t.bidGreeks, "bid_")
+
+                if t.askGreeks:
+                    self._handleTickOptionComputation(ticker_id, t.askGreeks, "ask_")
 
         if market_tickers:
             self.pendingMarketTickersEvent.emit(market_tickers)
@@ -455,6 +436,49 @@ class ezIBAsync:
             
             # except Exception as e:
             #     self._logger.error(f"Error handling ticker update for {contract.symbol if hasattr(contract, 'symbol') else 'unknown'}: {e}")
+
+    # -----------------------------------------
+    def _handleTickOptionComputation(self, ticker_id, computation, col_prepend=""):
+        """
+        https://www.interactivebrokers.com/en/software/api/apiguide/java/tickoptioncomputation.htm
+        """
+        def calc_generic_val(data, field):
+            last_val = data['last_' + field].values[-1]
+            bid_val  = data['bid_' + field].values[-1]
+            ask_val  = data['ask_' + field].values[-1]
+            bid_ask_val = last_val
+
+            if bid_val is not None and ask_val is not None:
+                bid_ask_val = (bid_val + ask_val) / 2
+            
+            if last_val is not None:
+                return max([last_val, bid_ask_val])
+            
+            return bid_ask_val
+
+        # create tick holder for ticker
+        # if msg.tickerId not in self.optionsData.keys():
+        #     self.optionsData[msg.tickerId] = self.optionsData[0].copy()
+
+        # save side
+        self.optionsData[ticker_id][col_prepend + 'imp_vol']  = computation.impliedVol
+        self.optionsData[ticker_id][col_prepend + 'dividend'] = computation.pvDividend
+        self.optionsData[ticker_id][col_prepend + 'delta'] = computation.delta
+        self.optionsData[ticker_id][col_prepend + 'gamma'] = computation.gamma
+        self.optionsData[ticker_id][col_prepend + 'vega'] = computation.vega
+        self.optionsData[ticker_id][col_prepend + 'theta'] = computation.theta
+        self.optionsData[ticker_id][col_prepend + 'price'] = computation.optPrice
+
+        # save generic/mid
+        option = self.optionsData[ticker_id]
+        self.optionsData[ticker_id]['imp_vol'] = calc_generic_val(option, 'imp_vol')
+        self.optionsData[ticker_id]['dividend'] = calc_generic_val(option, 'dividend')
+        self.optionsData[ticker_id]['delta'] = calc_generic_val(option, 'delta')
+        self.optionsData[ticker_id]['gamma'] = calc_generic_val(option, 'gamma')
+        self.optionsData[ticker_id]['vega'] = calc_generic_val(option, 'vega')
+        self.optionsData[ticker_id]['theta'] = calc_generic_val(option, 'theta')
+        self.optionsData[ticker_id]['price'] = calc_generic_val(option, 'price')
+        self.optionsData[ticker_id]['underlying'] = computation.undPrice
 
     # ---------------------------------------
     # Accounts handling
