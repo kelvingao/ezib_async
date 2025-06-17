@@ -230,6 +230,27 @@ class ezIBAsync:
     async def requestMarketData(self, contracts=None, snapshot=False):
         """
         Register to streaming market data updates.
+        https://www.interactivebrokers.com/campus/ibkr-api-page/twsapi-doc/#available-tick-types
+
+        # 100: putVolume, callVolume (for options)
+        # 101: putOpenInterest, callOpenInterest (for options)
+        # 104: histVolatility (for options)
+        # 105: avOptionVolume (for options)
+        # 106: impliedVolatility (for options)
+        # 162: indexFuturePremium
+        # 165: low13week, high13week, low26week, high26week, low52week, high52week, avVolume
+        # 221: markPrice
+        # 225: auctionVolume, auctionPrice, auctionImbalance
+        # 233: last, lastSize, rtVolume, rtTime, vwap (Time & Sales)
+        # 236: shortableShares
+        # 258: fundamentalRatios
+        # 293: tradeCount
+        # 294: tradeRate
+        # 295: volumeRate
+        # 375: rtTradeVolume
+        # 411: rtHistVolatility
+        # 456: dividends
+        # 588: futuresOpenInterest
         
         Args:
             contracts: Contract or list of contracts to request market data for.
@@ -248,7 +269,14 @@ class ezIBAsync:
             if self.isMultiContract(contract):
                 self._logger.debug(f"Skipping multi-contract: {contract.symbol}")
                 continue
-                
+            
+            if snapshot:
+                reqType = ""
+            else:
+                reqType = '233' # GENERIC_TICKS_RTVOLUME
+                if contract.secType in ("OPT", "FOP"):
+                    reqType = '100,101,106' # GENERIC_TICKS_NONE
+
             try:
                 # Get ticker ID for the contract
                 contractSring = self.contractString(contract)
@@ -257,7 +285,7 @@ class ezIBAsync:
                 self._logger.info(f"Requesting market data for {contract.symbol} ({contractSring})")
                     
                 # Request market data
-                self.ib.reqMktData(contract, '', snapshot, False)
+                self.ib.reqMktData(contract, reqType, snapshot, False)
                 
                 # Small delay to avoid overwhelming IB API (max 500 requests/second)
                 await asyncio.sleep(0.0021)
@@ -411,8 +439,10 @@ class ezIBAsync:
                 # Handle open interest field based on contract type
                 if contract.right == "C" and hasattr(t, "callOpenInterest"):
                     df2use[ticker_id]['oi'] = t.callOpenInterest
+                    # df2use[ticker_id]['volume'] = t.callVolume
                 elif contract.right == "P" and hasattr(t, "putOpenInterest"):
                     df2use[ticker_id]['oi'] = t.putOpenInterest
+                    # df2use[ticker_id]['volume'] = t.putVolume
                 
                 # Handle implied volatility - prioritize impliedVolatility if available
                 df2use[ticker_id]['iv'] = t.impliedVolatility
