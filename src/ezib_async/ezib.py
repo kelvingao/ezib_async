@@ -1279,6 +1279,13 @@ class ezIBAsync:
         
         # Return order ID
         return trade
+    
+    # -----------------------------------------
+    def cancelOrder(self, order):
+        """ cancel order on IB TWS """
+        trade = self.ib.cancelOrder(order)
+
+        return trade
 
     # ---------------------------------------
     async def requestContractDetails(self, contract):
