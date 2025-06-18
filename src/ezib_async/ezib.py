@@ -1957,6 +1957,69 @@ class ezIBAsync:
         return None
 
     # -----------------------------------------
+    def handleTrailingStops(self, tickerId):
+        """ software-based trailing stop """
+
+        # existing?
+        if tickerId not in self.trailingStops.keys():
+            return None
+
+        # continue
+        trailingStop   = self.trailingStops[tickerId]
+        price          = self.marketData[tickerId]['last'][0]
+        symbol         = self.tickerSymbol(tickerId)
+        # contract       = self.contracts[tickerId]
+        # contractString = self.contractString(contract)
+
+        if self.default_account is None:
+            self.default_account = list(self._positions.keys())[0]
+
+        # filled / no positions?
+        if (self._positions[self.default_account][symbol] == 0) | \
+                (self.orders[trailingStop['orderId']]['status'] == "FILLED"):
+            del self.trailingStops[tickerId]
+            return None
+
+        # continue...
+        newStop  = trailingStop['lastPrice']
+        ticksize = trailingStop['ticksize']
+
+        # long
+        if (trailingStop['quantity'] < 0) & (trailingStop['lastPrice'] < price):
+            if abs(trailingStop['trailAmount']) >= 0:
+                newStop = price - abs(trailingStop['trailAmount'])
+            elif trailingStop['trailPercent'] >= 0:
+                newStop = price - (price * (abs(trailingStop['trailPercent']) / 100))
+        # short
+        elif (trailingStop['quantity'] > 0) & (trailingStop['lastPrice'] > price):
+            if abs(trailingStop['trailAmount']) >= 0:
+                newStop = price + abs(trailingStop['trailAmount'])
+            elif trailingStop['trailPercent'] >= 0:
+                newStop = price + (price * (abs(trailingStop['trailPercent']) / 100))
+
+        # valid newStop
+        newStop = self.roundClosestValid(newStop, ticksize)
+
+        # print("\n\n", trailingStop['lastPrice'], newStop, price, "\n\n")
+
+        # no change?
+        if newStop == trailingStop['lastPrice']:
+            return None
+
+        # submit order
+        trailingStopOrderId = self.modifyStopOrder(
+            orderId  = trailingStop['orderId'],
+            parentId = trailingStop['parentId'],
+            newStop  = newStop,
+            quantity = trailingStop['quantity']
+        )
+
+        if trailingStopOrderId:
+            self.trailingStops[tickerId]['lastPrice'] = price
+
+        return trailingStopOrderId
+
+    # -----------------------------------------
     def triggerTrailingStops(self, tickerId, **kwargs):
         """ trigger waiting trailing stops """
         # print('.')
