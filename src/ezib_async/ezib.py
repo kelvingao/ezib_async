@@ -130,6 +130,17 @@ class ezIBAsync:
         })
         self.marketDepthData: Dict[int, DataFrame] = {0: l2DF}  # idx = tickerId
 
+        # triggerable trailing stops
+        self.triggerableTrailingStops = {}
+        # "tickerId" = {
+        #     parentId: ...
+        #     stopOrderId: ...
+        #     triggerPrice: ...
+        #     trailPercent: ...
+        #     trailAmount: ...
+        #     quantity: ...
+        # }
+
         # holds options data
         optionsDF = DataFrame({
             "datetime": [0], "oi": [0], "volume": [0], "underlying": [0], "iv": [0],
@@ -1804,6 +1815,8 @@ class ezIBAsync:
         return order
     
     # -----------------------------------------
+    # trailing stops
+    # -----------------------------------------
     def createTriggerableTrailingStop(self, symbol, quantity=1,
             triggerPrice=0, trailPercent=100., trailAmount=0.,
             parentId=0, stopOrderId=None, targetOrderId=None,
@@ -1830,9 +1843,6 @@ class ezIBAsync:
         Returns:
             Dictionary with trailing stop parameters
         """
-        # Initialize the triggerableTrailingStops dictionary if it doesn't exist
-        if not hasattr(self, 'triggerableTrailingStops'):
-            self.triggerableTrailingStops = {}
 
         ticksize = self.contractDetails(symbol)["minTick"]
 
@@ -1849,6 +1859,11 @@ class ezIBAsync:
         }
 
         return self.triggerableTrailingStops[symbol]
+
+    # -----------------------------------------
+    def cancelTriggerableTrailingStop(self, symbol):
+        """ cancel **pending** triggerable trailing stop """
+        del self.triggerableTrailingStops[symbol]
 
     # -----------------------------------------
     def createBracketOrder(self, contract, quantity,
