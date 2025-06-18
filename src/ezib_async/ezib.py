@@ -130,6 +130,16 @@ class ezIBAsync:
         })
         self.marketDepthData: Dict[int, DataFrame] = {0: l2DF}  # idx = tickerId
 
+        # trailing stops
+        self.trailingStops = {}
+        # "tickerId" = {
+        #     orderId: ...
+        #     lastPrice: ...
+        #     trailPercent: ...
+        #     trailAmount: ...
+        #     quantity: ...
+        # }
+
         # triggerable trailing stops
         self.triggerableTrailingStops = {}
         # "tickerId" = {
@@ -1886,6 +1896,25 @@ class ezIBAsync:
         """ cancel **pending** triggerable trailing stop """
         del self.triggerableTrailingStops[symbol]
     
+    # -----------------------------------------
+    def registerTrailingStop(self, tickerId, orderId=0, quantity=1,
+            lastPrice=0, trailPercent=100., trailAmount=0., parentId=0, **kwargs):
+        """ adds trailing stop to monitor list """
+
+        ticksize = self.contractDetails(tickerId)["minTick"]
+
+        trailingStop = self.trailingStops[tickerId] = {
+            "orderId": orderId,
+            "parentId": parentId,
+            "lastPrice": lastPrice,
+            "trailAmount": trailAmount,
+            "trailPercent": trailPercent,
+            "quantity": quantity,
+            "ticksize": ticksize
+        }
+
+        return trailingStop
+
     # -----------------------------------------
     def modifyStopOrder(self, orderId, parentId, newStop, quantity,
                         transmit=True, stop_limit=False, account=None):
