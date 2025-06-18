@@ -1709,6 +1709,59 @@ class ezIBAsync:
         raise ValueError("Account %s not found in account list" % account)
 
     # -----------------------------------------
+    def _assgin_order_to_account(self, order):
+        # assign order to account_orders dict
+        account_key = order["account"]
+        if account_key == "":
+            return
+        # new account?
+        if account_key not in self.account_orders.keys():
+            self.account_orders[account_key] = {}
+        self.account_orders[account_key][order['id']] = order
+
+    # -----------------------------------------
+    def getOrders(self, account=None):
+        if len(self.account_orders) == 0:
+            return {}
+
+        account = self._get_active_account(account)
+
+        if account is None:
+            if len(self.account_orders) > 1:
+                raise ValueError("Must specify account number as multiple accounts exists.")
+            return self.account_orders[list(self.account_orders.keys())[0]]
+
+        if account == "*":
+            return self.orders
+
+        if account in self.account_orders:
+            return self.account_orders[account]
+
+        raise ValueError("Account %s not found in account list" % account)
+
+    # -----------------------------------------
+    def group_orders(self, by="symbol", account=None):
+        orders = {}
+        collection = self.orders
+        if account is not None:
+            if account not in self.account_orders:
+                self.account_orders[account] = {}
+            collection = self.account_orders[account]
+
+        for orderId in collection:
+            order = collection[orderId]
+
+            if order[by] not in orders.keys():
+                orders[order[by]] = {}
+
+            # try: del order["contract"]
+            # except Exception: pass
+
+            orders[order[by]][order['id']] = order
+
+        return orders
+
+    # -----------------------------------------
     # Order Creation Methods
     # -----------------------------------------
     def createTargetOrder(self, quantity, parentId=0,
