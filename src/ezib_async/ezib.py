@@ -1897,6 +1897,29 @@ class ezIBAsync:
         del self.triggerableTrailingStops[symbol]
     
     # -----------------------------------------
+    def modifyTriggerableTrailingStop(self, symbol, quantity=1,
+            triggerPrice=0, trailPercent=100., trailAmount=0.,
+            parentId=0, stopOrderId=None, targetOrderId=None, **kwargs):
+
+        params = {
+            "symbol": symbol,
+            "quantity": quantity,
+            "triggerPrice": triggerPrice,
+            "trailPercent": abs(trailPercent),
+            "trailAmount": abs(trailAmount),
+            "parentId": parentId,
+            "stopOrderId": stopOrderId,
+            "targetOrderId": targetOrderId,
+        }
+
+        if symbol in self.triggerableTrailingStops:
+            original = self.triggerableTrailingStops[symbol]
+            self.cancelTriggerableTrailingStop(symbol)
+            params = {**original, **kwargs}
+
+        return self.createTriggerableTrailingStop(**params)
+    
+    # -----------------------------------------
     def registerTrailingStop(self, tickerId, orderId=0, quantity=1,
             lastPrice=0, trailPercent=100., trailAmount=0., parentId=0, **kwargs):
         """ adds trailing stop to monitor list """
