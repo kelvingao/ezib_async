@@ -1813,7 +1813,28 @@ class ezIBAsync:
 
         order = self.createOrder(**order_data)
         return order
-    
+
+    # -----------------------------------------
+    def createTrailingStopOrder(self, contract, quantity,
+            parentId=0, trailType='percent', trailValue=100.,
+            group=None, stopTrigger=None, account=None, **kwargs):
+
+        """ convert hard stop order to trailing stop order """
+        if parentId not in self.orders:
+            raise ValueError("Order #" + str(parentId) + " doesn't exist or wasn't submitted")
+
+        order = self.createStopOrder(quantity,
+                    stop     = trailValue,
+                    trail    = trailType,
+                    transmit = True,
+                    trigger  = stopTrigger,
+                    # ocaGroup = group
+                    parentId = parentId,
+                    account  = self._get_active_account(account)
+                )
+
+        return self.placeOrder(contract, order)
+
     # -----------------------------------------
     # trailing stops
     # -----------------------------------------
