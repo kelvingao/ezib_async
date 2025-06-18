@@ -1885,6 +1885,24 @@ class ezIBAsync:
     def cancelTriggerableTrailingStop(self, symbol):
         """ cancel **pending** triggerable trailing stop """
         del self.triggerableTrailingStops[symbol]
+    
+    # -----------------------------------------
+    def modifyStopOrder(self, orderId, parentId, newStop, quantity,
+                        transmit=True, stop_limit=False, account=None):
+        """ modify stop order """
+        if orderId in self.orders.keys():
+            order = self.createStopOrder(
+                quantity = quantity,
+                parentId = parentId,
+                stop     = newStop,
+                stop_limit = stop_limit,
+                trail    = False,
+                transmit = transmit,
+                account  = self._get_active_account(account)
+            )
+            return self.placeOrder(self.orders[orderId]['contract'], order)
+
+        return None
 
     # -----------------------------------------
     def createBracketOrder(self, contract, quantity,
