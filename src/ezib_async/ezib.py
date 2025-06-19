@@ -247,6 +247,10 @@ class ezIBAsync:
             # market / options / depth data handler
             self.ib.pendingTickersEvent += self._onPendingTickersHandler
 
+            # order handlers
+            self.ib.openOrderEvent += self._onOpenOrderHandler
+            self.ib.orderStatusEvent += self._onOrderStatusHandler
+
     # ---------------------------------------
     async def requestMarketData(self, contracts=None, snapshot=False):
         """
@@ -1240,7 +1244,7 @@ class ezIBAsync:
                 order.ocaType = kwargs["ocaType"]
             else:
                 order.ocaType = 2  # Proportionally reduce remaining orders' size
-        
+    
         # Trailing stop order
         if "trailingPercent" in kwargs:
             order.trailingPercent = kwargs["trailingPercent"]
@@ -1290,7 +1294,7 @@ class ezIBAsync:
             "reason":       None,
             "avgFillPrice": 0.,
             "parentId":     0,
-            # "time":         datetime.fromtimestamp(int(self.time)),
+            "time":         trade.log[-1].time,
             "account":      None
         }
         
@@ -1604,15 +1608,15 @@ class ezIBAsync:
     # def positions(self):
     #     return self.getPositions()
     
-    @property
-    def positions(self):
-        return self._positions
+    # @property
+    # def positions(self):
+    #     return self._positions
     
     @property
-    def position(self):
-        return self.getPosition()
+    def positions(self):
+        return self.getPositions()
 
-    def getPosition(self, account=None):
+    def getPositions(self, account=None):
         if len(self._positions) == 0:
             return {}
 
@@ -1695,7 +1699,7 @@ class ezIBAsync:
         if len(self._portfolios) == 0:
             return {}
 
-        account = self._get_active_account(account)
+        account = self._get_acve_account(account)
 
         if account is None:
             return []
@@ -1707,6 +1711,101 @@ class ezIBAsync:
             return self._portfolios[account]
 
         raise ValueError("Account %s not found in account list" % account)
+
+    # -----------------------------------------
+    # Order handling
+    # -----------------------------------------
+    def _onOpenOrderHandler(self, trade):
+        """ handle order open """
+
+        # we need to handle mutiple events for the same order status
+        duplicateMessage = False
+
+        # contract identifier
+        contractString = self.contractString(trade.contract)
+
+        order_account = trade.order.account
+        if trade.order.orderId in self.orders and self.orders[trade.order.orderId]["status"] == "SENT":
+            order_account = self.orders[trade.order.orderId]["account"]
+            try:
+                del self.orders[trade.order.orderId]
+            except Exception:
+                pass
+        # order_account = self._get_active_account(order_account)
+
+        if trade.order.orderId in self.orders:
+            duplicateMessage = True
+            self._logger.warning("Duplicate order #" + str(trade.order.orderId) + " received")
+        else:
+            self.orders[trade.order.orderId] = {
+                "id":       trade.order.orderId,
+                "symbol":   contractString,
+                "contract": trade.contract,
+                "order":    trade.order,
+                "quantity": trade.order.totalQuantity,
+                "action":   trade.order.action,
+                "status":   "OPENED",
+                "reason":   None,
+                "avgFillPrice": 0.,
+                "parentId": 0,
+                "attached": set(),
+                "time": None, #trade.log[-1].time,
+                "account": order_account
+            }
+            self._assgin_order_to_account(self.orders[trade.order.orderId])
+        
+        if duplicateMessage is False:
+            # group orders by symbol
+            self.symbol_orders = self.group_orders("symbol")
+            # group orders by accounts->symbol
+            # print("group orders by accounts->symbol", self._accounts)
+            # for accountCode in self.accountCodes:
+            self.account_symbols_orders[trade.order.account] = self.group_orders(
+                "symbol", trade.order.account)
+
+    def _onOrderStatusHandler(self, trade):
+        """
+        """
+        duplicateMessage = False
+
+        if trade.order.orderId in self.orders and self.orders[trade.order.orderId]['status'] == trade.orderStatus.status.upper():
+            duplicateMessage = True
+            self._logger.warning("Duplicate order #" + str(trade.order.orderId) + " received")
+        else:
+            # remove cancelled orphan orders
+            # if "CANCELLED" in msg.status.upper() and msg.parentId not in self.orders.keys():
+            #     try: del self.orders[msg.orderId]
+            #     except Exception: pass
+            # # otherwise, update order status
+            # else:
+            self.orders[trade.order.orderId]['status'] = trade.orderStatus.status.upper()
+            self.orders[trade.order.orderId]['reason'] = trade.orderStatus.whyHeld
+            self.orders[trade.order.orderId]['avgFillPrice'] = float(trade.orderStatus.avgFillPrice)
+            self.orders[trade.order.orderId]['parentId'] = int(trade.orderStatus.parentId)
+            self.orders[trade.order.orderId]['time'] = trade.log[-1].time
+            self.orders[trade.order.orderId]['account'] = trade.order.account
+
+        # remove from orders? no! (keep log)
+        # if msg.status.upper() == 'CANCELLED':
+        #     del self.orders[msg.orderId]
+
+        # attach sub-orders
+        # if hasattr(msg, 'parentId'):
+        parentId = self.orders[trade.order.orderId]['parentId']
+        if parentId > 0 and parentId in self.orders:
+            if 'attached' not in self.orders[parentId]:
+                self.orders[parentId]['attached'] = set()
+            self.orders[parentId]['attached'].add(trade.order.orderId)
+
+        # cancel orphan sub-orders
+        if self.orders[trade.order.orderId]['status'] == "FILLED":
+            order = self.orders[trade.order.orderId]
+            positions = self.getPositions(order['account'])
+            if (positions[order['symbol']] == 0):
+                for orderId in order['attached']:
+                    self.cancelOrder(orderId)
+
+        self._assgin_order_to_account(self.orders[trade.order.orderId])
 
     # -----------------------------------------
     def _assgin_order_to_account(self, order):
@@ -2177,9 +2276,9 @@ class ezIBAsync:
                 if targetOrderId and targetOrderId in self.orders.keys():
                     # self.cancelOrder(targetOrderId)
                     targetOrder = self.orders[targetOrderId]['order']
-                    targetOrder.m_auxPrice = 0 if quantity < 0 else 1000000
+                    targetOrder.auxPrice = 0 if quantity < 0 else 1000000
                     self.placeOrder(contract, order, targetOrderId,
-                                    targetOrder.m_account)
+                                    targetOrder.account)
 
                 # register trailing stop
                 tickerId = self.tickerId(symbol)
