@@ -45,3 +45,8 @@ coverage.xml
 .windsurfrules
 *.log
 logs/
+.claude
+CLAUDE.md
+INITIAL.md
+PRPs/
+
