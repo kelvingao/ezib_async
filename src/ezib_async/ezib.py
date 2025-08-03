@@ -38,8 +38,8 @@ from ib_async import (
 from eventkit import Event
 
 # check python version
-if sys.version_info < (3, 11):
-    raise SystemError("ezIBAsync requires Python version >= 3.11")
+if sys.version_info < (3, 12):
+    raise SystemError("ezIBAsync requires Python version >= 3.12")
 
 class ezIBAsync:
     """

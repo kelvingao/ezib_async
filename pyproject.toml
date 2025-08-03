@@ -3,16 +3,16 @@ name = "ezib-async"
 dynamic = ["version"]
 description = "An asynchronous Python wrapper for Interactive Brokers API based on ib_async, providing a more Pythonic and asyncio-friendly interface."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
-    "ib-async>=1.0.3",
+    "ib-async>=2.0.1",
     "pandas>=2.2.3",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.11"
+    "Programming Language :: Python :: 3.12"
 ]
 
 [project.optional-dependencies]

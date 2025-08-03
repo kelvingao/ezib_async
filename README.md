@@ -1,6 +1,6 @@
 # ezib_async
 
-![Python version](https://img.shields.io/badge/python-3.11+-blue.svg?style=flat)
+![Python version](https://img.shields.io/badge/python-3.12+-blue.svg?style=flat)
 ![PyPi version](https://img.shields.io/pypi/v/ezib_async.svg?maxAge=60)
 ![PyPi status](https://img.shields.io/pypi/status/ezib_async.svg?maxAge=60)
 
@@ -188,7 +188,7 @@ ezib = ezib_async.ezIBAsync()
 
 ## Requirements
 
-- Python 3.11+
+- Python 3.12+
 - ib_async 1.0.3+
 - Interactive Brokers TWS or Gateway
 
