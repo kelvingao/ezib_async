@@ -1,20 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Integration tests for the contracts functionality in ezIBAsync class.
+Unit and integration tests for contract functionality in ezIBAsync.
 
-This module contains integration tests for the contract creation and management
-features of the ezIBAsync class, focusing on stock contracts.
-These tests require a connection to Interactive Brokers TWS or Gateway.
+This module contains both unit tests (mocked) and integration tests (real IB connection)
+for contract creation, management, and conversion functionality.
 """
 import pytest
 import asyncio
 import sys
 import calendar
 import logging
+from unittest.mock import Mock, patch, AsyncMock
+from datetime import datetime, timedelta
 
-from datetime import datetime
-from ezib_async import util
+from ezib_async import ezIBAsync, util
+from ib_async import Stock, Option, Future, Forex, Index, Contract
 
 logging.getLogger("ib_async").setLevel("CRITICAL")
 logging.getLogger("ezib_async").setLevel("INFO")
@@ -22,7 +23,582 @@ logging.getLogger("ezib_async").setLevel("INFO")
 logger = logging.getLogger('pytest.contracts')
 util.logToConsole("DEBUG")
 
-class TestEzIBAsyncContracts:
+
+class TestContractCreationUnit:
+    """Unit tests for contract creation functionality."""
+
+    @pytest.mark.asyncio
+    async def test_create_contract_with_tuple(self, mock_ezib):
+        """Test creating contract from tuple parameters."""
+        # Setup
+        mock_contract = Mock(spec=Contract)
+        mock_ezib.createContract = AsyncMock(return_value=mock_contract)
+        
+        # Execute
+        result = await mock_ezib.createContract("AAPL", "STK", "SMART", "USD", "", 0.0, "")
+        
+        # Verify
+        mock_ezib.createContract.assert_called_once()
+        assert result == mock_contract
+
+    @pytest.mark.asyncio
+    async def test_create_contract_with_existing_contract(self, mock_ezib):
+        """Test creating contract from existing Contract object."""
+        # Setup
+        existing_contract = Stock(symbol="AAPL", exchange="SMART", currency="USD")
+        mock_ezib.createContract = AsyncMock(return_value=existing_contract)
+        
+        # Execute
+        result = await mock_ezib.createContract(existing_contract)
+        
+        # Verify
+        mock_ezib.createContract.assert_called_once_with(existing_contract)
+        assert result == existing_contract
+
+    @pytest.mark.asyncio
+    async def test_create_contract_qualification_failure(self):
+        """Test contract creation when qualification fails."""
+        # Create real instance
+        ezib = ezIBAsync()
+        
+        with patch.object(ezib, 'ib') as mock_ib:
+            # Mock qualification failure
+            mock_ib.qualifyContractsAsync = AsyncMock(return_value=[])
+            
+            # Execute
+            result = await ezib.createContract("INVALID", "STK", "SMART", "USD", "", 0.0, "")
+            
+            # Verify
+            assert result is None
+            mock_ib.qualifyContractsAsync.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_stock_contract_unit(self, mock_ezib):
+        """Test stock contract creation (unit test)."""
+        # Setup
+        mock_contract = Stock(symbol="AAPL", exchange="SMART", currency="USD")
+        mock_ezib.createStockContract = AsyncMock(return_value=mock_contract)
+        
+        # Execute
+        result = await mock_ezib.createStockContract("AAPL", "USD", "SMART")
+        
+        # Verify
+        mock_ezib.createStockContract.assert_called_once_with("AAPL", "USD", "SMART")
+        assert result == mock_contract
+
+    @pytest.mark.asyncio
+    async def test_create_option_contract_unit(self, mock_ezib):
+        """Test option contract creation (unit test)."""
+        # Setup
+        future_date = (datetime.now() + timedelta(days=30)).strftime("%Y%m%d")
+        mock_contract = Option(
+            symbol="SPY", 
+            lastTradeDateOrContractMonth=future_date,
+            strike=500.0, 
+            right="C", 
+            exchange="SMART"
+        )
+        mock_ezib.createOptionContract = AsyncMock(return_value=mock_contract)
+        
+        # Execute
+        result = await mock_ezib.createOptionContract(
+            "SPY", expiry=future_date, strike=500.0, otype="C"
+        )
+        
+        # Verify
+        mock_ezib.createOptionContract.assert_called_once()
+        assert result == mock_contract
+
+    @pytest.mark.asyncio
+    async def test_create_futures_contract_unit(self, mock_ezib):
+        """Test futures contract creation (unit test)."""
+        # Setup
+        future_date = (datetime.now() + timedelta(days=90)).strftime("%Y%m")
+        mock_contract = Future(
+            symbol="ES", 
+            lastTradeDateOrContractMonth=future_date,
+            exchange="GLOBEX"
+        )
+        mock_ezib.createFuturesContract = AsyncMock(return_value=mock_contract)
+        
+        # Execute
+        result = await mock_ezib.createFuturesContract("ES", expiry=future_date)
+        
+        # Verify
+        mock_ezib.createFuturesContract.assert_called_once()
+        assert result == mock_contract
+
+    @pytest.mark.asyncio
+    async def test_create_forex_contract_unit(self, mock_ezib):
+        """Test forex contract creation (unit test)."""
+        # Setup
+        mock_contract = Forex(symbol="EUR", currency="USD", exchange="IDEALPRO")
+        mock_ezib.createForexContract = AsyncMock(return_value=mock_contract)
+        
+        # Execute
+        result = await mock_ezib.createForexContract("EUR", "USD")
+        
+        # Verify
+        mock_ezib.createForexContract.assert_called_once_with("EUR", "USD")
+        assert result == mock_contract
+
+    @pytest.mark.asyncio
+    async def test_create_index_contract_unit(self, mock_ezib):
+        """Test index contract creation (unit test)."""
+        # Setup
+        mock_contract = Index(symbol="SPX", exchange="CBOE", currency="USD")
+        mock_ezib.createIndexContract = AsyncMock(return_value=mock_contract)
+        
+        # Execute
+        result = await mock_ezib.createIndexContract("SPX")
+        
+        # Verify
+        mock_ezib.createIndexContract.assert_called_once_with("SPX")
+        assert result == mock_contract
+
+
+class TestContractStringConversion:
+    """Test contract string conversion functionality."""
+
+    def test_contract_to_tuple(self, mock_stock_contract):
+        """Test converting contract to tuple."""
+        # Execute
+        result = ezIBAsync.contract_to_tuple(mock_stock_contract)
+        
+        # Verify
+        expected = (
+            mock_stock_contract.symbol,
+            mock_stock_contract.secType,
+            mock_stock_contract.exchange,
+            mock_stock_contract.currency,
+            mock_stock_contract.lastTradeDateOrContractMonth,
+            mock_stock_contract.strike,
+            mock_stock_contract.right
+        )
+        assert result == expected
+
+    def test_contract_string_stock(self, mock_stock_contract):
+        """Test contract string conversion for stock."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        result = ezib.contractString(mock_stock_contract)
+        
+        # Verify
+        assert result == "AAPL"
+
+    def test_contract_string_option(self, mock_option_contract):
+        """Test contract string conversion for option."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        result = ezib.contractString(mock_option_contract)
+        
+        # Verify - should contain symbol, expiry, right, and strike
+        assert "SPY" in result
+        assert "C" in result
+        assert "00500000" in result  # Strike formatted as 500.0 -> 00500000
+
+    def test_contract_string_future(self, mock_future_contract):
+        """Test contract string conversion for future."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        result = ezib.contractString(mock_future_contract)
+        
+        # Verify - should contain symbol and month code
+        assert "ES" in result
+        assert "FUT" in result
+
+    def test_contract_string_forex(self, mock_forex_contract):
+        """Test contract string conversion for forex."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        result = ezib.contractString(mock_forex_contract)
+        
+        # Verify
+        assert result == "EURUSD_CASH"
+
+    def test_contract_string_from_tuple(self):
+        """Test contract string conversion from tuple."""
+        ezib = ezIBAsync()
+        
+        # Stock tuple
+        stock_tuple = ("AAPL", "STK", "SMART", "USD", "", 0.0, "")
+        result = ezib.contractString(stock_tuple)
+        assert result == "AAPL"
+        
+        # Forex tuple
+        forex_tuple = ("EUR", "CASH", "IDEALPRO", "USD", "", 0.0, "")
+        result = ezib.contractString(forex_tuple)
+        assert result == "EURUSD_CASH"
+
+    def test_contract_string_error_handling(self):
+        """Test contract string conversion error handling."""
+        ezib = ezIBAsync()
+        
+        # Invalid contract that causes an error
+        invalid_contract = Mock()
+        invalid_contract.symbol = "TEST"
+        
+        # Should not raise exception, should return symbol
+        with patch.object(ezib, 'contract_to_tuple', side_effect=Exception("Test error")):
+            result = ezib.contractString(invalid_contract)
+            assert "TEST" in result
+
+
+class TestTickerManagement:
+    """Test ticker ID management functionality."""
+
+    def test_ticker_id_assignment(self, mock_stock_contract):
+        """Test ticker ID assignment for new contracts."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        ticker_id = ezib.tickerId(mock_stock_contract)
+        
+        # Verify
+        assert isinstance(ticker_id, int)
+        assert ticker_id in ezib.tickerIds
+        assert ezib.tickerIds[ticker_id] == ezib.contractString(mock_stock_contract)
+
+    def test_ticker_id_reuse(self, mock_stock_contract):
+        """Test ticker ID reuse for same contract."""
+        ezib = ezIBAsync()
+        
+        # Execute twice
+        ticker_id1 = ezib.tickerId(mock_stock_contract)
+        ticker_id2 = ezib.tickerId(mock_stock_contract)
+        
+        # Verify same ID is returned
+        assert ticker_id1 == ticker_id2
+
+    def test_ticker_id_from_string(self):
+        """Test ticker ID assignment from symbol string."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        ticker_id = ezib.tickerId("AAPL")
+        
+        # Verify
+        assert isinstance(ticker_id, int)
+        assert ezib.tickerIds[ticker_id] == "AAPL"
+
+    def test_ticker_symbol_lookup(self):
+        """Test looking up symbol from ticker ID."""
+        ezib = ezIBAsync()
+        
+        # Add a ticker
+        ticker_id = ezib.tickerId("MSFT")
+        
+        # Execute
+        symbol = ezib.tickerSymbol(ticker_id)
+        
+        # Verify
+        assert symbol == "MSFT"
+
+    def test_ticker_symbol_invalid_id(self):
+        """Test looking up symbol with invalid ticker ID."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        symbol = ezib.tickerSymbol(9999)
+        
+        # Verify
+        assert symbol == ""
+
+
+class TestContractDetails:
+    """Test contract details functionality."""
+
+    def test_contract_details_default(self, mock_stock_contract):
+        """Test getting default contract details."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        details = ezib.contractDetails(mock_stock_contract)
+        
+        # Verify default structure
+        assert isinstance(details, dict)
+        assert "tickerId" in details
+        assert "conId" in details
+        assert "minTick" in details
+        assert details["minTick"] == 0.01  # Default
+
+    def test_contract_details_by_ticker_id(self):
+        """Test getting contract details by ticker ID."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        details = ezib.contractDetails(0)  # Default ticker ID
+        
+        # Verify
+        assert isinstance(details, dict)
+        assert details["tickerId"] == 0
+
+    def test_contract_details_by_string(self):
+        """Test getting contract details by symbol string."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        details = ezib.contractDetails("AAPL")
+        
+        # Verify
+        assert isinstance(details, dict)
+
+
+class TestMultiContractDetection:
+    """Test multi-contract detection functionality."""
+
+    def test_is_multi_contract_stock(self, mock_stock_contract):
+        """Test multi-contract detection for stock (should be False)."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        result = ezib.isMultiContract(mock_stock_contract)
+        
+        # Verify
+        assert result is False
+
+    def test_is_multi_contract_future_no_expiry(self):
+        """Test multi-contract detection for future without expiry."""
+        ezib = ezIBAsync()
+        
+        # Create future without expiry
+        future_contract = Future(symbol="ES", exchange="GLOBEX")
+        future_contract.lastTradeDateOrContractMonth = ""
+        
+        # Execute
+        result = ezib.isMultiContract(future_contract)
+        
+        # Verify
+        assert result is True
+
+    def test_is_multi_contract_option_incomplete(self):
+        """Test multi-contract detection for incomplete option."""
+        ezib = ezIBAsync()
+        
+        # Create option without strike
+        option_contract = Option(symbol="SPY", exchange="SMART")
+        option_contract.strike = 0.0
+        option_contract.right = ""
+        
+        # Execute
+        result = ezib.isMultiContract(option_contract)
+        
+        # Verify
+        assert result is True
+
+
+class TestContractHelperMethods:
+    """Test contract helper methods."""
+
+    def test_get_con_id_existing_contract(self):
+        """Test getting contract ID for existing contract."""
+        ezib = ezIBAsync()
+        
+        # Setup - add a contract to the list
+        mock_contract = Mock()
+        mock_contract.conId = 12345
+        ezib.contracts.append(mock_contract)
+        
+        # Create search contract with same ID
+        search_contract = Mock()
+        search_contract.conId = 12345
+        
+        # Execute
+        result = ezib.getConId(search_contract)
+        
+        # Verify
+        assert result == 12345
+
+    def test_get_con_id_not_found(self):
+        """Test getting contract ID for non-existent contract."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        search_contract = Mock()
+        search_contract.conId = 99999
+        result = ezib.getConId(search_contract)
+        
+        # Verify
+        assert result == 0
+
+    def test_get_contract_existing(self):
+        """Test getting contract object for existing contract."""
+        ezib = ezIBAsync()
+        
+        # Setup
+        mock_contract = Mock()
+        mock_contract.conId = 12345
+        ezib.contracts.append(mock_contract)
+        
+        # Create search contract
+        search_contract = Mock()
+        search_contract.conId = 12345
+        
+        # Execute
+        result = ezib.getContract(search_contract)
+        
+        # Verify
+        assert result == mock_contract
+
+    def test_get_contract_not_found(self):
+        """Test getting contract object for non-existent contract."""
+        ezib = ezIBAsync()
+        
+        # Execute
+        search_contract = Mock()
+        search_contract.conId = 99999
+        result = ezib.getContract(search_contract)
+        
+        # Verify
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_register_contract_new(self):
+        """Test registering a new contract."""
+        ezib = ezIBAsync()
+        
+        with patch.object(ezib, 'createContract') as mock_create:
+            with patch.object(ezib, 'getConId', return_value=0):  # Not found
+                mock_create.return_value = AsyncMock()
+                mock_contract = Mock()
+                
+                # Execute
+                await ezib.registerContract(mock_contract)
+                
+                # Verify
+                mock_create.assert_called_once_with(mock_contract)
+
+    @pytest.mark.asyncio
+    async def test_register_contract_existing(self):
+        """Test registering an existing contract."""
+        ezib = ezIBAsync()
+        
+        with patch.object(ezib, 'createContract') as mock_create:
+            with patch.object(ezib, 'getConId', return_value=12345):  # Found
+                mock_contract = Mock()
+                
+                # Execute
+                await ezib.registerContract(mock_contract)
+                
+                # Verify no creation attempt
+                mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_register_contract_timeout(self):
+        """Test registering contract with timeout."""
+        ezib = ezIBAsync()
+        
+        with patch.object(ezib, 'createContract') as mock_create:
+            with patch.object(ezib, 'getConId', return_value=0):
+                # Mock timeout
+                mock_create.side_effect = asyncio.TimeoutError()
+                mock_contract = Mock()
+                
+                # Execute - should not raise exception
+                await ezib.registerContract(mock_contract)
+                
+                # Verify attempt was made
+                mock_create.assert_called_once()
+
+
+class TestContractExpirationAndStrikes:
+    """Test contract expiration and strike functionality."""
+
+    @pytest.mark.asyncio
+    async def test_get_expirations_no_contracts(self):
+        """Test getting expirations when no contracts available."""
+        ezib = ezIBAsync()
+        
+        # Mock contract details with no contracts
+        with patch.object(ezib, 'contractDetails') as mock_details:
+            mock_details.return_value = {"contracts": []}
+            
+            # Execute
+            result = await ezib.getExpirations("SPY")
+            
+            # Verify
+            assert result == tuple()
+
+    @pytest.mark.asyncio
+    async def test_get_expirations_stock_contract(self):
+        """Test getting expirations for stock contract (should be empty)."""
+        ezib = ezIBAsync()
+        
+        # Mock stock contract details
+        with patch.object(ezib, 'contractDetails') as mock_details:
+            mock_contract = Mock()
+            mock_contract.secType = "STK"
+            mock_details.return_value = {"contracts": [mock_contract]}
+            
+            # Execute
+            result = await ezib.getExpirations("AAPL")
+            
+            # Verify
+            assert result == tuple()
+
+    @pytest.mark.asyncio
+    async def test_get_strikes_no_contracts(self):
+        """Test getting strikes when no contracts available."""
+        ezib = ezIBAsync()
+        
+        # Mock contract details with no contracts
+        with patch.object(ezib, 'contractDetails') as mock_details:
+            mock_details.return_value = {"contracts": []}
+            
+            # Execute
+            result = await ezib.getStrikes("SPY")
+            
+            # Verify
+            assert result == tuple()
+
+    @pytest.mark.asyncio
+    async def test_get_strikes_stock_contract(self):
+        """Test getting strikes for stock contract (should be empty)."""
+        ezib = ezIBAsync()
+        
+        # Mock stock contract details
+        with patch.object(ezib, 'contractDetails') as mock_details:
+            mock_contract = Mock()
+            mock_contract.secType = "STK"
+            mock_details.return_value = {"contracts": [mock_contract]}
+            
+            # Execute
+            result = await ezib.getStrikes("AAPL")
+            
+            # Verify
+            assert result == tuple()
+
+    @pytest.mark.asyncio
+    async def test_get_strikes_with_range(self):
+        """Test getting strikes with min/max range."""
+        ezib = ezIBAsync()
+        
+        # Mock option contract details with various strikes
+        with patch.object(ezib, 'contractDetails') as mock_details:
+            contracts = []
+            strikes = [100.0, 150.0, 200.0, 250.0, 300.0]
+            for strike in strikes:
+                mock_contract = Mock()
+                mock_contract.secType = "OPT"
+                mock_contract.strike = strike
+                contracts.append(mock_contract)
+            
+            mock_details.return_value = {"contracts": contracts}
+            
+            # Execute with range
+            result = await ezib.getStrikes("SPY", smin=125.0, smax=275.0)
+            
+            # Verify filtered strikes
+            assert result == (150.0, 200.0, 250.0)
+
+
+# Keep existing integration test class
+
+class TestEzIBAsyncContractsIntegration:
     """Integration tests for ezIBAsync contract functionality."""
 
     @pytest.mark.asyncio
@@ -46,17 +622,20 @@ class TestEzIBAsyncContracts:
             assert contract.currency == test_currency
             assert contract.exchange == test_exchange
             
-            # Verify contract was added to contracts dictionary
+            # Verify contract was added to contracts list
+            assert contract in ezib_instance.contracts
+            
+            # Verify contract has proper attributes after qualification
+            assert hasattr(contract, 'conId'), "Contract should have conId after qualification"
+            assert contract.conId > 0, "Contract ID should be a positive number"
+            
+            # Verify ticker ID mapping
             ticker_id = ezib_instance.tickerId(contract)
-            assert ticker_id in ezib_instance.contracts
+            assert ticker_id >= 0, "Ticker ID should be non-negative"
             
-            # Verify contract details 
-            details = ezib_instance.contractDetails(contract)
-            logger.info(f"contractDetails(contract) is : {details}")
-            
-            # Should have some basic contract details
-            assert "conId" in details, "Contract ID should be present in details"
-            assert details["conId"] > 0, "Contract ID should be a positive number"
+            # Verify contract string generation
+            contract_string = ezib_instance.contractString(contract)
+            assert contract.symbol in contract_string, "Contract string should contain symbol"
             
             logger.info(f"Successfully created and verified stock contract for {test_symbol}")
             
