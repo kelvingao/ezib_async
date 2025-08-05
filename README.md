@@ -9,45 +9,14 @@
 
 ezib_async is a modern, high-performance Python library that provides a clean, asyncio-based interface to Interactive Brokers' TWS API. Built on top of ib_async, it simplifies trading operations with a more Pythonic approach while maintaining full compatibility with IB's extensive feature set.
 
-## 🏗️ Architecture Overview
-
-```
-┌─────────────────┐    asyncio    ┌─────────────────┐    IB API    ┌─────────────────┐
-│   Your Trading  │◄──────────────┤   ezib_async    │◄─────────────┤ Interactive     │
-│   Application   │               │    Wrapper      │              │ Brokers         │
-│                 │               │                 │              │ TWS/Gateway     │
-└─────────────────┘               └─────────────────┘              └─────────────────┘
-         │                                 │
-         │                                 │
-         ▼                                 ▼
-┌─────────────────┐               ┌─────────────────┐
-│   Real-time     │               │   Auto-updating │
-│   Market Data   │               │   Properties    │
-│   • Stocks      │               │   • Positions   │
-│   • Options     │               │   • Account     │
-│   • Futures     │               │   • Portfolio   │
-│   • Forex       │               │   • Orders      │
-└─────────────────┘               └─────────────────┘
-```
-
-### Core Components
-
-- **Contract Creation**: Simplified helpers for stocks, options, futures, and forex
-- **Order Management**: Market, limit, stop, and bracket order support
-- **Real-time Data**: Live market data with automatic updates
-- **Event System**: Built on eventkit for responsive data handling
-- **Account Tracking**: Auto-updating positions, portfolio, and account information
-
 ## 🚀 Features
 
 - ✅ **Fully Asynchronous**: Built from the ground up with Python's asyncio
-- ✅ **Clean API**: Simplified interface reduces boilerplate code significantly
+- ✅ **Account Tracking**: Auto-updating positions, portfolio, and account information
 - ✅ **Real-time Updates**: Auto-updating properties for market data and account info
 - ✅ **Multi-Asset Support**: Stocks, options, futures, forex, and indices
-- ✅ **Advanced Orders**: Market, limit, stop, trailing stops, and bracket orders
-- ✅ **Event-Driven**: Subscribe to market data and account changes
+- ✅ **Order Management**: Market, limit, stop, trailing stops, and bracket orders
 - ✅ **Historical Data**: Flexible retrieval with multiple time frames
-- ✅ **Production Ready**: Comprehensive error handling and logging
 
 ## 📋 Requirements
 
