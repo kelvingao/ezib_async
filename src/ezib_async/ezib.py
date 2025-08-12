@@ -26,7 +26,7 @@ import sys
 import asyncio
 import logging
 
-from pandas import DataFrame
+from pandas import DataFrame, Series
 from typing import Dict, List
 from ib_async import (
     IB,
@@ -38,8 +38,8 @@ from ib_async import (
 from eventkit import Event
 
 # check python version
-if sys.version_info < (3, 12):
-    raise SystemError("ezIBAsync requires Python version >= 3.12")
+if sys.version_info < (3, 11):
+    raise SystemError("ezIBAsync requires Python version >= 3.11")
 
 class ezIBAsync:
     """
@@ -119,36 +119,43 @@ class ezIBAsync:
         self._logger = logging.getLogger('ezib_async.ezib')
 
         # holds market data
-        tickDF = DataFrame({
-            "datetime": [0], "bid": [0], "bidsize": [0],
-            "ask": [0], "asksize": [0], "last": [0], "lastsize": [0]
+        tickDF = DataFrame(index=range(1), data={
+            "datetime": Series(dtype="datetime64[ns]"), "iv": Series(dtype=float),
+            "bid": Series(dtype=float), "bidsize": Series(dtype=float),
+            "ask": Series(dtype=float), "asksize": Series(dtype=float),
+            "last": Series(dtype=float), "lastsize": Series(dtype=float),
+            "timestamp": Series(dtype="datetime64[ns]"), "volume": Series(dtype=float)
         })
         tickDF.set_index('datetime', inplace=True)
-        self.marketData: Dict[int, DataFrame] = {0: tickDF}  # idx = tickerId
+        self.marketData = {0: tickDF}  # idx = tickerId
 
         # holds orderbook data
         l2DF = DataFrame(index=range(5), data={
-            "bid": 0, "bidsize": 0,
-            "ask": 0, "asksize": 0
+            "bid": Series(dtype=float), "bidsize": Series(dtype=float),
+            "ask": Series(dtype=float), "asksize": Series(dtype=float)
         })
-        self.marketDepthData: Dict[int, DataFrame] = {0: l2DF}  # idx = tickerId
+        self.marketDepthData = {0: l2DF}  # idx = tickerId
 
         # holds options data
-        optionsDF = DataFrame({
-            "datetime": [0], "oi": [0], "volume": [0], "underlying": [0], "iv": [0],
-            "bid": [0], "bidsize": [0], "ask": [0], "asksize": [0], "last": [0], "lastsize": [0],
-            # opt field
-            "price": [0], "dividend": [0], "imp_vol": [0], "delta": [0],
-            "gamma": [0], "vega": [0], "theta": [0],
-            "last_price": [0], "last_dividend": [0], "last_imp_vol": [0], "last_delta": [0],
-            "last_gamma": [0], "last_vega": [0], "last_theta": [0],
-            "bid_price": [0], "bid_dividend": [0], "bid_imp_vol": [0], "bid_delta": [0],
-            "bid_gamma": [0], "bid_vega": [0], "bid_theta": [0],
-            "ask_price": [0], "ask_dividend": [0], "ask_imp_vol": [0], "ask_delta": [0],
-            "ask_gamma": [0], "ask_vega": [0], "ask_theta": [0],
+        optionsDF = DataFrame(index=range(1), data={
+            "datetime": Series(dtype="datetime64[ns]"), "iv": Series(dtype=float), "oi": Series(dtype=float),
+            "bid": Series(dtype=float), "bidsize": Series(dtype=float),
+            "ask": Series(dtype=float), "asksize": Series(dtype=float),
+            "last": Series(dtype=float), "lastsize": Series(dtype=float),
+            "volume": Series(dtype=float), "underlying": Series(dtype=float),
+            "timestamp": Series(dtype="datetime64[ns]"),
+            # opt fields
+            "price": Series(dtype=float), "dividend": Series(dtype=float), "imp_vol": Series(dtype=float),
+            "delta": Series(dtype=float), "gamma": Series(dtype=float), "vega": Series(dtype=float), "theta": Series(dtype=float),
+            "last_price": Series(dtype=float), "last_dividend": Series(dtype=float), "last_imp_vol": Series(dtype=float),
+            "last_delta": Series(dtype=float), "last_gamma": Series(dtype=float), "last_vega": Series(dtype=float), "last_theta": Series(dtype=float),
+            "bid_price": Series(dtype=float), "bid_dividend": Series(dtype=float), "bid_imp_vol": Series(dtype=float),
+            "bid_delta": Series(dtype=float), "bid_gamma": Series(dtype=float), "bid_vega": Series(dtype=float), "bid_theta": Series(dtype=float),
+            "ask_price": Series(dtype=float), "ask_dividend": Series(dtype=float), "ask_imp_vol": Series(dtype=float),
+            "ask_delta": Series(dtype=float), "ask_gamma": Series(dtype=float), "ask_vega": Series(dtype=float), "ask_theta": Series(dtype=float),
         })
         optionsDF.set_index('datetime', inplace=True)
-        self.optionsData: Dict[int, DataFrame] = {0: optionsDF}  # idx = tickerId
+        self.optionsData = {0: optionsDF}  # idx = tickerId
 
         # Initialize the IB client directly
         self.ib = IB()
@@ -159,6 +166,7 @@ class ezIBAsync:
 
     def _createEvents(self):
 
+        self.pendingQuotersEvent = Event("pendingQuotersEvent")
         self.pendingMarketTickersEvent = Event("pendingMarketTickersEvent")
         self.pendingOptionsTickersEvent = Event("pendingOptionsTickersEvent")
         self.updateMarketDepthEvent = Event("updateMarketDepthEvent")
@@ -383,7 +391,65 @@ class ezIBAsync:
             # Skip None tickers
             if not t or not hasattr(t, 'contract') or not t.contract:
                 continue
+
+            contract = t.contract
+            symbol = self.contractString(contract)
+            tickerId = self.tickerId(symbol)
+
+            # handle market depth
+            if tickerId not in self.marketDepthData:
+                self.marketDepthData[tickerId] = self.marketDepthData[0].copy()
+
+            df = self.marketDepthData[tickerId]
+
+            if t.domBids:
+                # update top 5 bids
+                for position, level in enumerate(t.domBids[:5]):
+                    df.loc[position, "bid"] = level.price
+                    df.loc[position, "bidsize"] = level.size
+
+            if t.domAsks:
+                # update top 5 asks
+                for position, level in enumerate(t.domAsks[:5]):
+                    df.loc[position, "ask"] = level.price
+                    df.loc[position, "asksize"] = level.size
+
+            # handle market data
+            df2use = self.marketData
+            is_option = contract.secType in ("OPT", "FOP")
+            if is_option:
+                df2use = self.optionsData
+
+            if tickerId not in df2use:
+                df2use[tickerId] = df2use[0].copy()
+
+            # Update market & options common fields
+            df2use[tickerId].index = [t.time]
+            df2use[tickerId]["timestamp"] = t.time
+            df2use[tickerId]["bid"] = t.bid
+            df2use[tickerId]["bidsize"] = t.bidSize
+            df2use[tickerId]["ask"] = t.ask
+            df2use[tickerId]["asksize"] = t.askSize
+            df2use[tickerId]["last"] = t.last
+            df2use[tickerId]["lastsize"] = t.lastSize
+            df2use[tickerId]["volume"] = t.volume  # trading volume for the day
+            # df2use[tickerId]["vwap"] = t.vwap
+            df2use[tickerId]["iv"] = t.impliedVolatility
+            df2use[tickerId]["oi"] = t.callOpenInterest + t.putOpenInterest
+
+            if is_option:
+                if t.lastGreeks:
+                    self._handleTickOptionComputation(tickerId, t.lastGreeks, "last_")
+
+                if t.bidGreeks:
+                    self._handleTickOptionComputation(tickerId, t.bidGreeks, "bid_")
+
+                if t.askGreeks:
+                    self._handleTickOptionComputation(tickerId, t.askGreeks, "ask_")
+
+            self.pendingQuotersEvent.emit(tickerId)
             
+            # Also maintain compatibility with existing events
             if t.domAsks:
                 market_depth_tickers.append(t)
             
@@ -394,68 +460,6 @@ class ezIBAsync:
                 options_tickers.append(t)
             else:
                 market_tickers.append(t)
-                # contract = t.contract
-                # symbol = self.contractString(contract)
-                # ticker_id = self.tickerId(symbol)
-
-                # is_option = contract.secType in ("OPT", "FOP")
-                # df2use = self.optionsData if is_option else self.marketData
-
-                # # Ensure the ticker exists in our data structure
-                # if ticker_id not in df2use:
-                #     df2use[ticker_id] = df2use[0].copy()
-                    
-                # # Update common market data fields
-                # for field, attr in COMMON_FIELD_MAPPING.items():
-                #     if field == "datetime":
-                #         df2use[ticker_id].index = [getattr(t, attr)]
-                #     else:
-                #         df2use[ticker_id][field] = getattr(t, attr)
-
-                # if is_option:
-
-                #     # Handle open interest field based on contract type
-                #     if contract.secType == "OPT":
-                #         if contract.right == "C" and hasattr(t, "callOpenInterest"):
-                #             df2use[ticker_id]['oi'] = t.callOpenInterest
-                #         elif contract.right == "P" and hasattr(t, "putOpenInterest"):
-                #             df2use[ticker_id]['oi'] = t.putOpenInterest
-                #     elif contract.secType == "FOP" and hasattr(t, "futuresOpenInterest"):
-                #         df2use[ticker_id]['oi'] = t.futuresOpenInterest
-                    
-                #     # Handle implied volatility - prioritize impliedVolatility if available
-                #     if hasattr(t, "impliedVolatility") and t.impliedVolatility is not None and t.impliedVolatility < 1e6:
-                #         df2use[ticker_id]['iv'] = t.impliedVolatility
-                #     elif hasattr(t, "lastGreeks") and hasattr(t.lastGreeks, "impliedVol") and t.lastGreeks.impliedVol is not None:
-                #         df2use[ticker_id]['iv'] = t.lastGreeks.impliedVol
-                                    
-                #     if t.modelGreeks:
-                #         for key, attr in OPT_FOP_MODELGREEKS_MAPPING.items():
-                #             if hasattr(t.modelGreeks, attr):
-                #                 val = getattr(t.modelGreeks, attr)
-                #                 if val and val < 1e6:
-                #                     df2use[ticker_id][key] = val
-                    
-                #     if t.lastGreeks:
-                #         for key, attr in OPT_FOP_LASTGREEKS_MAPPING.items():
-                #             if hasattr(t.lastGreeks, attr):
-                #                 val = getattr(t.lastGreeks, attr)
-                #                 if val and val < 1e6:
-                #                     df2use[ticker_id][key] = val
-                    
-                #     if t.bidGreeks:
-                #         for key, attr in OPT_FOP_BIDGREEKS_MAPPING.items():
-                #             if hasattr(t.bidGreeks, attr):
-                #                 val = getattr(t.bidGreeks, attr)
-                #                 if val and val < 1e6:
-                #                     df2use[ticker_id][key] = val
-
-                #     if t.askGreeks:
-                #         for key, attr in OPT_FOP_ASKGREEKS_MAPPING.items():
-                #             if hasattr(t.askGreeks, attr):
-                #                 val = getattr(t.askGreeks, attr)
-                #                 if val and val < 1e6:
-                #                     df2use[ticker_id][key] = val
 
         # Always emit events (even with empty lists for testing)
         self.pendingMarketTickersEvent.emit(market_tickers)
@@ -1962,3 +1966,55 @@ class ezIBAsync:
                 "targetOrderId": targetOrderId,
                 "stopOrderId": stopOrderId
             }
+
+    # -----------------------------------------
+    def _handleTickOptionComputation(self, ticker_id, computation, col_prepend=""):
+        """
+        Handle option computation data (Greeks) from IB.
+        
+        Args:
+            ticker_id: The ticker ID for the option
+            computation: Option computation object with Greeks data
+            col_prepend: Prefix for column names (last_, bid_, ask_)
+            
+        Reference:
+        https://www.interactivebrokers.com/en/software/api/apiguide/java/tickoptioncomputation.htm
+        """
+        
+        def calc_generic_val(data, field):
+            """Calculate generic value from last, bid, ask data."""
+            last_val = data["last_" + field].values[-1]
+            bid_val = data["bid_" + field].values[-1]
+            ask_val = data["ask_" + field].values[-1]
+            bid_ask_val = last_val
+
+            if bid_val is not None and ask_val is not None:
+                bid_ask_val = (bid_val + ask_val) / 2
+
+            if last_val is not None:
+                return max([last_val, bid_ask_val])
+
+            return bid_ask_val
+
+        # Ensure ticker exists in options data
+        if ticker_id not in self.optionsData:
+            self.optionsData[ticker_id] = self.optionsData[0].copy()
+
+        # Save side-specific values
+        self.optionsData[ticker_id][col_prepend + "imp_vol"] = computation.impliedVol
+        self.optionsData[ticker_id][col_prepend + "dividend"] = computation.pvDividend
+        self.optionsData[ticker_id][col_prepend + "delta"] = computation.delta
+        self.optionsData[ticker_id][col_prepend + "gamma"] = computation.gamma
+        self.optionsData[ticker_id][col_prepend + "vega"] = computation.vega
+        self.optionsData[ticker_id][col_prepend + "theta"] = computation.theta
+        self.optionsData[ticker_id][col_prepend + "price"] = computation.optPrice
+
+        # Calculate and save generic/mid values
+        option = self.optionsData[ticker_id]
+        self.optionsData[ticker_id]["imp_vol"] = calc_generic_val(option, "imp_vol")
+        self.optionsData[ticker_id]["dividend"] = calc_generic_val(option, "dividend")
+        self.optionsData[ticker_id]["delta"] = calc_generic_val(option, "delta")
+        self.optionsData[ticker_id]["gamma"] = calc_generic_val(option, "gamma")
+        self.optionsData[ticker_id]["vega"] = calc_generic_val(option, "vega")
+        self.optionsData[ticker_id]["theta"] = calc_generic_val(option, "theta")
+        self.optionsData[ticker_id]["price"] = calc_generic_val(option, "price")
