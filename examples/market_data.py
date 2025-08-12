@@ -52,14 +52,37 @@ async def main():
         
         for contract in contracts:
             symbol = contract.symbol
-            if symbol in ezib.marketData:
-                data = ezib.marketData[symbol]
+            ticker_id = ezib.tickerId(ezib.contractString(contract))
+            is_option = contract.secType in ("OPT", "FOP")
+            
+            # Choose the correct data source based on contract type
+            data_source = ezib.optionsData if is_option else ezib.marketData
+            
+            if ticker_id in data_source:
+                data = data_source[ticker_id]
                 print(f"\n{symbol} ({contract.secType}):")
-                print(f"  Bid: {data.get('bid', 'N/A')}")
-                print(f"  Ask: {data.get('ask', 'N/A')}")
-                print(f"  Last: {data.get('last', 'N/A')}")
+                
+                # Extract latest data from DataFrame
+                if hasattr(data, 'iloc') and len(data) > 0:
+                    latest = data.iloc[-1]
+                    print(f"  Bid: {latest.get('bid', 'N/A')}")
+                    print(f"  Ask: {latest.get('ask', 'N/A')}")
+                    print(f"  Last: {latest.get('last', 'N/A')}")
+                    print(f"  Bid Size: {latest.get('bidsize', 'N/A')}")
+                    print(f"  Ask Size: {latest.get('asksize', 'N/A')}")
+                    print(f"  Last Size: {latest.get('lastsize', 'N/A')}")
+                    
+                    # Show additional data for options
+                    if is_option:
+                        print(f"  Implied Vol: {latest.get('iv', 'N/A')}")
+                        print(f"  Delta: {latest.get('delta', 'N/A')}")
+                        print(f"  Gamma: {latest.get('gamma', 'N/A')}")
+                        print(f"  Open Interest: {latest.get('oi', 'N/A')}")
+                else:
+                    print(f"  Data format: {type(data)}")
             else:
-                print(f"\n{symbol}: No data received")
+                data_type = "optionsData" if is_option else "marketData"
+                print(f"\n{symbol}: No data received (checked {data_type})")
         
         # Cancel requests
         ezib.cancelMarketData(contracts)
