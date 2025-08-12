@@ -30,131 +30,183 @@ from pandas import DataFrame, Series
 from typing import Dict, List
 from ib_async import (
     IB,
-    AccountValue, Position, PortfolioItem,
-    Contract, Stock, Future, Forex, Option, Index,
-    ComboLeg, Order
+    AccountValue,
+    Position,
+    PortfolioItem,
+    Contract,
+    Stock,
+    Future,
+    Forex,
+    Option,
+    Index,
+    ComboLeg,
+    Order,
 )
-
+from enum import Enum
 from eventkit import Event
 
 # check python version
 if sys.version_info < (3, 11):
     raise SystemError("ezIBAsync requires Python version >= 3.11")
 
+
+class ConnectionStatus(Enum):
+    CONNECTED = "CONNECTED"
+    INTERMEDIATE = (
+        "INTERMEDIATE"  # a nightly reset of the IB servers, or a competing session
+    )
+    DISCONNECTED = "DISCONNECTED"  # peer connection closed
+
+
 class ezIBAsync:
     """
     Asynchronous Interactive Brokers API client.
-    
+
     This class provides a high-level interface to the IB API with async support,
     managing connections, accounts, positions, portfolios, contracts, and orders.
     """
-    
+
     events = (
+        "pendingTickersEvent",
         "pendingMarketTickersEvent",
         "pendingOptionsTickersEvent",
-        "updateMarketDepthEvent"
+        "updateMarketDepthEvent",
     )
-    
+
     @staticmethod
-    def roundClosestValid(val, res = 0.01, decimals = None):
+    def roundClosestValid(val, res=0.01, decimals=None):
         """
         Round to closest valid resolution.
-        
+
         Args:
             val: Value to round
             res: Resolution to round to
             decimals: Number of decimal places
-            
+
         Returns:
             Rounded value
         """
         if val is None:
             return None
-            
-        # Handle invalid resolution values
-        if res == 0 or not isinstance(res, (int, float)):
-            return val
-            
+
         if decimals is None and "." in str(res):
-            decimals = len(str(res).split('.')[1])
-            
+            decimals = len(str(res).split(".")[1])
+
         return round(round(val / res) * res, decimals)
-    
-    def __init__(self, ibhost='127.0.0.1', ibport=4001, 
-                 ibclient=1, account=None):
+
+    def __init__(self, ibhost="127.0.0.1", ibport=4001, ibclient=1, account=None):
         """
         Initialize the ezIBAsync client.
-        
+
         Args:
             ibhost (str): Host address for IB connection
             ibport (int): Port number for IB connection
             ibclient (int): Client ID for IB connection
             account (str, optional): Default account to use
         """
-        self._createEvents()
+        self._setup_events()
 
         # store connection parameters
         self._ibhost = ibhost
-        self._ibport = ibport
+        self._ibport = ibport  # 7496/7497 = TWS, 4001 = IBGateway
         self._ibclient = ibclient
         self._default_account = account
-        
+
         # auto-construct for every contract/order
-        self.tickerIds: Dict[int, str] = {0: "SYMBOL"}
-        self.contracts: List[Contract] = []
-        self.orders: Dict[int, Order] = {}
-        self.account_orders: Dict[str, Dict[int, Order]] = {}
-        self.account_symbols_orders: Dict[str, Dict[str, List[Order]]] = {}
-        self.symbol_orders: Dict[str, List[Order]] = {}
+        self.tickerIds = {0: "SYMBOL"}
+        self.contracts = {}
+        self.orders = {}
+        self.account_orders = {}
+        self.account_symbols_orders = {}
+        self.symbol_orders = {}
+        self.commission = 0
 
-        # accounts
-        self._accounts: Dict[str, List[AccountValue]] = {}  # accountId -> accountValues
-        self._positions: Dict[str, Dict[str, Position]] = {}
-        self._portfolios: Dict[str, Dict[str, PortfolioItem]] = {}  # accountId -> contractString -> portfolioItem
-        self._contract_details: List[dict] = []  # multiple expiry/strike/side contracts
+        # accounts information
+        self._accounts = {}
+        self._accounts_summary = {}
+        self._positions = {}
+        self._portfolios = {}
+        self.contract_details = {}  # multiple expiry/strike/side contracts
+        self.localSymbolExpiry = {}
 
-        self.contract_details: Dict[str, dict] = {}
-        self.localSymbolExpiry: Dict[str, str] = {}
-
-        self._logger = logging.getLogger('ezib_async.ezib')
+        self._logger = logging.getLogger("ezib_async.ezib")
 
         # holds market data
-        tickDF = DataFrame(index=range(1), data={
-            "datetime": Series(dtype="datetime64[ns]"), "iv": Series(dtype=float),
-            "bid": Series(dtype=float), "bidsize": Series(dtype=float),
-            "ask": Series(dtype=float), "asksize": Series(dtype=float),
-            "last": Series(dtype=float), "lastsize": Series(dtype=float),
-            "timestamp": Series(dtype="datetime64[ns]"), "volume": Series(dtype=float)
-        })
-        tickDF.set_index('datetime', inplace=True)
+        tickDF = DataFrame(
+            index=range(1),
+            data={
+                "datetime": Series(dtype="datetime64[ns]"),
+                "iv": Series(dtype=float),
+                "bid": Series(dtype=float),
+                "bidsize": Series(dtype=float),
+                "ask": Series(dtype=float),
+                "asksize": Series(dtype=float),
+                "last": Series(dtype=float),
+                "lastsize": Series(dtype=float),
+            },
+        )
+        tickDF.set_index("datetime", inplace=True)
         self.marketData = {0: tickDF}  # idx = tickerId
 
         # holds orderbook data
-        l2DF = DataFrame(index=range(5), data={
-            "bid": Series(dtype=float), "bidsize": Series(dtype=float),
-            "ask": Series(dtype=float), "asksize": Series(dtype=float)
-        })
+        l2DF = DataFrame(
+            index=range(5),
+            data={
+                "bid": Series(dtype=float),
+                "bidsize": Series(dtype=float),
+                "ask": Series(dtype=float),
+                "asksize": Series(dtype=float),
+            },
+        )
         self.marketDepthData = {0: l2DF}  # idx = tickerId
 
         # holds options data
-        optionsDF = DataFrame(index=range(1), data={
-            "datetime": Series(dtype="datetime64[ns]"), "iv": Series(dtype=float), "oi": Series(dtype=float),
-            "bid": Series(dtype=float), "bidsize": Series(dtype=float),
-            "ask": Series(dtype=float), "asksize": Series(dtype=float),
-            "last": Series(dtype=float), "lastsize": Series(dtype=float),
-            "volume": Series(dtype=float), "underlying": Series(dtype=float),
-            "timestamp": Series(dtype="datetime64[ns]"),
-            # opt fields
-            "price": Series(dtype=float), "dividend": Series(dtype=float), "imp_vol": Series(dtype=float),
-            "delta": Series(dtype=float), "gamma": Series(dtype=float), "vega": Series(dtype=float), "theta": Series(dtype=float),
-            "last_price": Series(dtype=float), "last_dividend": Series(dtype=float), "last_imp_vol": Series(dtype=float),
-            "last_delta": Series(dtype=float), "last_gamma": Series(dtype=float), "last_vega": Series(dtype=float), "last_theta": Series(dtype=float),
-            "bid_price": Series(dtype=float), "bid_dividend": Series(dtype=float), "bid_imp_vol": Series(dtype=float),
-            "bid_delta": Series(dtype=float), "bid_gamma": Series(dtype=float), "bid_vega": Series(dtype=float), "bid_theta": Series(dtype=float),
-            "ask_price": Series(dtype=float), "ask_dividend": Series(dtype=float), "ask_imp_vol": Series(dtype=float),
-            "ask_delta": Series(dtype=float), "ask_gamma": Series(dtype=float), "ask_vega": Series(dtype=float), "ask_theta": Series(dtype=float),
-        })
-        optionsDF.set_index('datetime', inplace=True)
+        optionsDF = DataFrame(
+            index=range(1),
+            data={
+                "datetime": Series(dtype="datetime64[ns]"),
+                "iv": Series(dtype=float),
+                "oi": Series(dtype=float),
+                "bid": Series(dtype=float),
+                "bidsize": Series(dtype=float),
+                "ask": Series(dtype=float),
+                "asksize": Series(dtype=float),
+                "last": Series(dtype=float),
+                "lastsize": Series(dtype=float),
+                "volume": Series(dtype=float),
+                "underlying": Series(dtype=float),
+                # opt field
+                "price": Series(dtype=float),
+                "dividend": Series(dtype=float),
+                "imp_vol": Series(dtype=float),
+                "delta": Series(dtype=float),
+                "gamma": Series(dtype=float),
+                "vega": Series(dtype=float),
+                "theta": Series(dtype=float),
+                "last_price": Series(dtype=float),
+                "last_dividend": Series(dtype=float),
+                "last_imp_vol": Series(dtype=float),
+                "last_delta": Series(dtype=float),
+                "last_gamma": Series(dtype=float),
+                "last_vega": Series(dtype=float),
+                "last_theta": Series(dtype=float),
+                "bid_price": Series(dtype=float),
+                "bid_dividend": Series(dtype=float),
+                "bid_imp_vol": Series(dtype=float),
+                "bid_delta": Series(dtype=float),
+                "bid_gamma": Series(dtype=float),
+                "bid_vega": Series(dtype=float),
+                "bid_theta": Series(dtype=float),
+                "ask_price": Series(dtype=float),
+                "ask_dividend": Series(dtype=float),
+                "ask_imp_vol": Series(dtype=float),
+                "ask_delta": Series(dtype=float),
+                "ask_gamma": Series(dtype=float),
+                "ask_vega": Series(dtype=float),
+                "ask_theta": Series(dtype=float),
+            },
+        )
+        optionsDF.set_index("datetime", inplace=True)
         self.optionsData = {0: optionsDF}  # idx = tickerId
 
         # Initialize the IB client directly
@@ -162,21 +214,21 @@ class ezIBAsync:
         self.connected = False
         self._disconnected_by_user = False
 
-        self._setup_handlers()
+        self._register_events_handler()
 
-    def _createEvents(self):
-
+    def _setup_events(self):
+        # events
         self.pendingQuotersEvent = Event("pendingQuotersEvent")
+        self.pendingTickersEvent = Event("pendingTickersEvent")
         self.pendingMarketTickersEvent = Event("pendingMarketTickersEvent")
         self.pendingOptionsTickersEvent = Event("pendingOptionsTickersEvent")
         self.updateMarketDepthEvent = Event("updateMarketDepthEvent")
 
     # ---------------------------------------
-    async def connectAsync(self, ibhost=None, ibport=None, 
-                          ibclient=None, account=None):
+    async def connectAsync(self, ibhost=None, ibport=None, ibclient=None, account=None):
         """
         Connect to the Interactive Brokers TWS/Gateway asynchronously.
-        
+
         Args:
             ibhost (str, optional): Host address for IB connection
             ibport (int, optional): Port number for IB connection
@@ -187,16 +239,25 @@ class ezIBAsync:
         self._ibhost = ibhost if ibhost is not None else self._ibhost
         self._ibport = ibport if ibport is not None else self._ibport
         self._ibclient = ibclient if ibclient is not None else self._ibclient
-        self._default_account = account if account is not None else self._default_account
-        
+        self._default_account = (
+            account if account is not None else self._default_account
+        )
+
         try:
             # Connect using the IB client
             if self.connected:
                 return
 
-            self._logger.info(f"Connecting to IB at {self._ibhost}:{self._ibport} (client ID: {self._ibclient})")
-            await self.ib.connectAsync(host=self._ibhost, port=self._ibport, clientId=self._ibclient, account=self._default_account)
-            
+            self._logger.info(
+                f"Connecting to IB at {self._ibhost}:{self._ibport} (client ID: {self._ibclient})"
+            )
+            await self.ib.connectAsync(
+                host=self._ibhost,
+                port=self._ibport,
+                clientId=self._ibclient,
+                account=self._default_account,
+            )
+
             # Update connection state
             self.connected = self.ib.isConnected()
             self._logger.info("Connected to IB successfully")
@@ -205,24 +266,28 @@ class ezIBAsync:
             # Validate default account
             if self._default_account is not None:
                 if self._default_account not in self.accountCodes:
-                    self._logger.warning(f"Default account {self._default_account} not found in available accounts: {self.accountCodes}")
+                    self._logger.warning(
+                        f"Default account {self._default_account} not found in available accounts: {self.accountCodes}"
+                    )
                     # Switch to first available account
                     self._default_account = self.accountCodes[0]
-                    self._logger.warning(f"Switched default account to {self._default_account}")
+                    self._logger.warning(
+                        f"Switched default account to {self._default_account}"
+                    )
             else:
                 self._default_account = self.accountCodes[0]
                 self.ib.client.reqAccountUpdates(True, self._default_account)
-                
+
         except Exception as e:
             self._logger.error(f"Error connecting to IB: {e}")
             self.connected = False
             return False
 
     # ---------------------------------------
-    def _setup_handlers(self):
+    def _register_events_handler(self):
         """
         Registers event handlers for the Interactive Brokers TWS/Gateway connection.
-        
+
         """
         if self.ib is not None:
             # disconnection handler
@@ -237,58 +302,97 @@ class ezIBAsync:
             # market / options / depth data handler
             self.ib.pendingTickersEvent += self._onPendingTickersHandler
 
+            # error handler
+            self.ib.errorEvent += self._onErrorHandler
+
     # ---------------------------------------
     async def requestMarketData(self, contracts=None, snapshot=False):
         """
         Register to streaming market data updates.
-        
+        https://www.interactivebrokers.com/campus/ibkr-api-page/twsapi-doc/#available-tick-types
+
+        # 100: putVolume, callVolume (for options)
+        # 101: putOpenInterest, callOpenInterest (for options)
+        # 104: histVolatility (for options)
+        # 105: avOptionVolume (for options)
+        # 106: impliedVolatility (for options)
+        # 162: indexFuturePremium
+        # 165: low13week, high13week, low26week, high26week, low52week, high52week, avVolume
+        # 221: markPrice
+        # 225: auctionVolume, auctionPrice, auctionImbalance
+        # 233: last, lastSize, rtVolume, rtTime, vwap (Time & Sales)
+        # 236: shortableShares
+        # 258: fundamentalRatios
+        # 293: tradeCount
+        # 294: tradeRate
+        # 295: volumeRate
+        # 375: rtTradeVolume
+        # 411: rtHistVolatility
+        # 456: dividends
+        # 588: futuresOpenInterest
+
         Args:
             contracts: Contract or list of contracts to request market data for.
                        If None, uses all contracts in self.contracts.
             snapshot: If True, request a snapshot instead of streaming data.
         """
-            
+
         # Use all contracts if none specified
         if contracts is None:
-            contracts = self.contracts
+            contracts = self.contracts.values()
         elif not isinstance(contracts, list):
             contracts = [contracts]
-            
+
         for contract in contracts:
             # Skip multi-contracts (they need to be expanded first)
             if self.isMultiContract(contract):
                 self._logger.debug(f"Skipping multi-contract: {contract.symbol}")
                 continue
-                
+
+            if snapshot:
+                reqType = ""
+            else:
+                # reqType = '233' # GENERIC_TICKS_RTVOLUME
+                reqType = "100,101,106"
+                if contract.secType in ("OPT", "FOP"):
+                    reqType = "100,101,106"  # GENERIC_TICKS_NONE
+
             try:
                 # Get ticker ID for the contract
                 contractSring = self.contractString(contract)
-                
+
                 # Request market data
-                self._logger.info(f"Requesting market data for {contract.symbol} ({contractSring})")
-                    
+                self._logger.info(
+                    f"Requesting market data for {contract.symbol} ({contractSring})"
+                )
+
                 # Request market data
-                self.ib.reqMktData(contract, '', snapshot, False)
-                
+                self.ib.reqMktData(contract, reqType, snapshot, False)
+
                 # Small delay to avoid overwhelming IB API (max 500 requests/second)
                 await asyncio.sleep(0.0021)
-                
+
             except Exception as e:
-                self._logger.error(f"Error requesting market data for {contract.symbol}: {e}")
+                self._logger.error(
+                    f"Error requesting market data for {contract.symbol}: {e}"
+                )
+
     # ---------------------------------------
     def requestMarketDepth(self, contracts=None, num_rows=10):
-        
+
         if num_rows > 10:
             num_rows = 10
 
         if contracts == None:
-            contracts = self.contracts
+            contracts = self.contracts.values()
         elif not isinstance(contracts, list):
             contracts = [contracts]
 
         for contract in contracts:
             contractSring = self.contractString(contract)
-            self._logger.info(f"Requesting market depth for {contract.symbol} ({contractSring})")
+            self._logger.info(
+                f"Requesting market depth for {contract.symbol} ({contractSring})"
+            )
 
             ticker = self.ib.reqMktDepth(contract, numRows=num_rows)
             # ticker.updateEvent += self._handle_orderbook_update
@@ -297,7 +401,7 @@ class ezIBAsync:
     def cancelMarketDepth(self, contracts=None):
         """
         Cancel streaming market depth for contracts.
-        
+
         Args:
             contracts: Contract or list of contracts to cancel market depth for.
                       If None, cancels for all contracts in self.contracts.
@@ -305,37 +409,41 @@ class ezIBAsync:
         if not self.connected:
             self._logger.info("Not connected to IB")
             return
-            
+
         # Use all contracts if none specified
         if contracts is None:
             contracts = self.contracts
         elif not isinstance(contracts, list):
             contracts = [contracts]
-            
+
         for contract in contracts:
             try:
                 # Skip multi-contracts
                 if self.isMultiContract(contract):
                     continue
-                
+
                 contractString = self.contractString(contract)
-                    
+
                 # Cancel market data
-                self._logger.info(f"Canceling depth market data for {contract.symbol} ({contractString})")
+                self._logger.info(
+                    f"Canceling depth market data for {contract.symbol} ({contractString})"
+                )
                 self.ib.cancelMktDepth(contract)
-                
+
             except Exception as e:
-                self._logger.error(f"Canceling depth market data for {contract.symbol}: {e}")
-            
+                self._logger.error(
+                    f"Canceling depth market data for {contract.symbol}: {e}"
+                )
+
     def _handle_orderbook_update(self, ticker):
         self._logger.debug(f"Orderbook {ticker} received")
         self.updateMarketDepthEvent.emit(ticker)
-            
+
     # ---------------------------------------
     def cancelMarketData(self, contracts=None):
         """
         Cancel streaming market data for contracts.
-        
+
         Args:
             contracts: Contract or list of contracts to cancel market data for.
                       If None, cancels for all contracts in self.contracts.
@@ -343,27 +451,31 @@ class ezIBAsync:
         if not self.connected:
             self._logger.info("Not connected to IB")
             return
-            
+
         # Use all contracts if none specified
         if contracts is None:
-            contracts = self.contracts
+            contracts = self.contracts.values()
         elif not isinstance(contracts, list):
             contracts = [contracts]
-            
+
         for contract in contracts:
             try:
                 # Skip multi-contracts
                 if self.isMultiContract(contract):
                     continue
-                
+
                 contractString = self.contractString(contract)
-                    
+
                 # Cancel market data
-                self._logger.info(f"Canceling market data for {contract.symbol} ({contractString})")
+                self._logger.info(
+                    f"Canceling market data for {contract.symbol} ({contractString})"
+                )
                 self.ib.cancelMktData(contract)
-                
+
             except Exception as e:
-                self._logger.error(f"Error canceling market data for {contract.symbol}: {e}")
+                self._logger.error(
+                    f"Error canceling market data for {contract.symbol}: {e}"
+                )
 
     # -----------------------------------------
     # Market data event handlers
@@ -371,26 +483,14 @@ class ezIBAsync:
     def _onPendingTickersHandler(self, tickers):
         """
         Handle consolidated ticker updates from IB.
-        
-        This single handler processes all types of market data updates (price, size, 
+
+        This single handler processes all types of market data updates (price, size,
         option computation, etc.) using ib_async's consolidated ticker objects.
-        
+
         Args:
             tickers: List of Ticker objects with updated data
         """
-
-        market_tickers = []
-        options_tickers = []
-        market_depth_tickers = []
-
-        # Handle None tickers
-        if tickers is None:
-            return
-
         for t in tickers:
-            # Skip None tickers
-            if not t or not hasattr(t, 'contract') or not t.contract:
-                continue
 
             contract = t.contract
             symbol = self.contractString(contract)
@@ -448,28 +548,59 @@ class ezIBAsync:
                     self._handleTickOptionComputation(tickerId, t.askGreeks, "ask_")
 
             self.pendingQuotersEvent.emit(tickerId)
-            
-            # Also maintain compatibility with existing events
-            if t.domAsks:
-                market_depth_tickers.append(t)
-            
-            if t.domBids:
-                market_depth_tickers.append(t)
-                
-            if t.contract.secType in ("OPT", "FOP"):
-                options_tickers.append(t)
-            else:
-                market_tickers.append(t)
 
-        # Always emit events (even with empty lists for testing)
-        self.pendingMarketTickersEvent.emit(market_tickers)
-        if options_tickers:
-            self.pendingOptionsTickersEvent.emit(options_tickers)
-        if market_depth_tickers:
-            self.updateMarketDepthEvent.emit(market_depth_tickers)
-            
-            # except Exception as e:
-            #     self._logger.error(f"Error handling ticker update for {contract.symbol if hasattr(contract, 'symbol') else 'unknown'}: {e}")
+    # -----------------------------------------
+    def _handleTickOptionComputation(self, ticker_id, computation, col_prepend=""):
+        """
+        https://www.interactivebrokers.com/en/software/api/apiguide/java/tickoptioncomputation.htm
+        """
+
+        def calc_generic_val(data, field):
+            last_val = data["last_" + field].values[-1]
+            bid_val = data["bid_" + field].values[-1]
+            ask_val = data["ask_" + field].values[-1]
+            bid_ask_val = last_val
+
+            if bid_val is not None and ask_val is not None:
+                bid_ask_val = (bid_val + ask_val) / 2
+
+            if last_val is not None:
+                return max([last_val, bid_ask_val])
+
+            return bid_ask_val
+
+        # create tick holder for ticker
+        # if msg.tickerId not in self.optionsData.keys():
+        #     self.optionsData[msg.tickerId] = self.optionsData[0].copy()
+
+        # save side
+        self.optionsData[ticker_id][col_prepend + "imp_vol"] = computation.impliedVol
+        self.optionsData[ticker_id][col_prepend + "dividend"] = computation.pvDividend
+        self.optionsData[ticker_id][col_prepend + "delta"] = computation.delta
+        self.optionsData[ticker_id][col_prepend + "gamma"] = computation.gamma
+        self.optionsData[ticker_id][col_prepend + "vega"] = computation.vega
+        self.optionsData[ticker_id][col_prepend + "theta"] = computation.theta
+        self.optionsData[ticker_id][col_prepend + "price"] = computation.optPrice
+
+        # save generic/mid
+        option = self.optionsData[ticker_id]
+        self.optionsData[ticker_id]["imp_vol"] = calc_generic_val(option, "imp_vol")
+        self.optionsData[ticker_id]["dividend"] = calc_generic_val(option, "dividend")
+        self.optionsData[ticker_id]["delta"] = calc_generic_val(option, "delta")
+        self.optionsData[ticker_id]["gamma"] = calc_generic_val(option, "gamma")
+        self.optionsData[ticker_id]["vega"] = calc_generic_val(option, "vega")
+        self.optionsData[ticker_id]["theta"] = calc_generic_val(option, "theta")
+        self.optionsData[ticker_id]["price"] = calc_generic_val(option, "price")
+        self.optionsData[ticker_id]["underlying"] = computation.undPrice
+
+    def _onErrorHandler(self, req_id, error_code, error_string, contract):
+        """
+        https://interactivebrokers.github.io/tws-api/message_codes.html
+        """
+        if error_code == 1100:
+            self._logger.info(f"Error: {req_id}, {error_code}, {error_string}")
+        else:
+            self._logger.error(f"Error: {req_id}, {error_code}, {error_string}")
 
     # ---------------------------------------
     # Accounts handling
@@ -477,24 +608,19 @@ class ezIBAsync:
     def _onAccountValueHandler(self, value):
         """
         Handle account value updates from IB.
-        
+
         Args:
             value: AccountValue object from IB
         """
-        try:        
-            # Validate account name (don't accept empty accounts)
-            if not value.account or not value.account.strip():
-                self._logger.warning("Ignoring account value update with empty account name")
-                return
-                
+        try:
             # Create account entry if it doesn't exist
             if value.account not in self._accounts:
                 self._accounts[value.account] = {}
-                
+
             # Set value
             self._accounts[value.account][value.tag] = value.value
             # self._logger.debug(f"Account value update: {value.account} - {value.tag}: {value.value}")
-            
+
         except Exception as e:
             self._logger.error(f"Error handling account value update: {e}")
 
@@ -502,19 +628,21 @@ class ezIBAsync:
     def _onAccountSummaryHandler(self, summary):
         """
         Handle account summary updates from IB.
-        
+
         Args:
             summary: AccountSummary object from IB
         """
-        try:         
+        try:
             # Create account entry if it doesn't exist
             if summary.account not in self._accounts_summary:
                 self._accounts_summary[summary.account] = []
-                
+
             # Set value
             self._accounts_summary[summary.account].append(summary)
-            self._logger.debug(f"Account summary update: {summary.account} - {summary.tag}: {summary.value}")
-            
+            self._logger.debug(
+                f"Account summary update: {summary.account} - {summary.tag}: {summary.value}"
+            )
+
         except Exception as e:
             self._logger.error(f"Error handling account summary update: {e}")
 
@@ -523,7 +651,7 @@ class ezIBAsync:
     def accounts(self):
         """
         Get all account information.
-        
+
         """
         return self._accounts
 
@@ -531,7 +659,7 @@ class ezIBAsync:
     def accountsSummary(self):
         """
         Get all account summary information.
-        
+
         """
         return self._accounts_summary
 
@@ -539,13 +667,13 @@ class ezIBAsync:
     def account(self):
         """
         Get information for the default account.
-        
+
         Returns:
             Dictionary of account information
 
         """
         return self.getAccount()
-    
+
     @property
     def accountCodes(self):
         return list(self._accounts.keys())
@@ -554,40 +682,44 @@ class ezIBAsync:
     def _onDisconnectedHandler(self):
         """
         Disconnection event handler for Interactive Brokers TWS/Gateway.
-        
+
         """
         self.connected = False
 
         if not self._disconnected_by_user:
-            self._logger.warning("Disconnected from IB")
-            try:
-                asyncio.create_task(self._reconnect())
-            except RuntimeError:
-                # No event loop running, skip reconnection
-                self._logger.debug("No event loop running, skipping automatic reconnection")
+            self._logger.error("Peer closed connection.")
+            asyncio.create_task(self._reconnect())
 
-    async def _reconnect(self, reconnect_interval = 2, max_attempts=300):
+    async def _reconnect(self, reconnect_interval=2, max_attempts=300):
         """
         Reconnects to Interactive Brokers TWS/Gateway after a disconnection.
-        
+
         """
         attempt = 0
-        while not self.connected and attempt < max_attempts and not self._disconnected_by_user:
+        while (
+            not self.connected
+            and attempt < max_attempts
+            and not self._disconnected_by_user
+        ):
             attempt += 1
             self._logger.info(f"Reconnection attempt {attempt}/{max_attempts}...")
-            
+
             try:
                 await asyncio.sleep(reconnect_interval)
-                await self.connectAsync(ibhost=self._ibhost, ibport=self._ibport, ibclient=self._ibclient)
-                
+                await self.connectAsync(
+                    ibhost=self._ibhost, ibport=self._ibport, ibclient=self._ibclient
+                )
+
                 if self.connected:
                     self._logger.info("Reconnection successful")
                     break
             except Exception as e:
                 self._logger.error(f"Reconnection failed: {e}")
-                
+
         if not self.connected and attempt >= max_attempts:
-            self._logger.error(f"Failed to reconnect after {max_attempts} attempts, giving up")
+            self._logger.error(
+                f"Failed to reconnect after {max_attempts} attempts, giving up"
+            )
 
     # ---------------------------------------
     def disconnect(self):
@@ -599,18 +731,18 @@ class ezIBAsync:
             # cancel all tasks
             # tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
             # [t.cancel() for t in tasks]
-            
+
             # # waiting for close...
             # await asyncio.gather(*tasks, return_exceptions=True)
-            
+
             # disconnect
             self._disconnected_by_user = True
-            if self.connected and self.ib:
+            if self.connected:
                 self.ib.client.reqAccountUpdates(False, self._default_account)
                 self._logger.info("Disconnecting from IB")
                 self.ib.disconnect()
+                self.connected = False
                 self._logger.info("Disconnected.")
-            self.connected = False
         except Exception as e:
             self._logger.error(f"Error during disconnection: {str(e)}")
 
@@ -623,7 +755,9 @@ class ezIBAsync:
 
         if account is None:
             if len(self._accounts) > 1:
-                raise ValueError("Must specify account number as multiple accounts exists.")
+                raise ValueError(
+                    "Must specify account number as multiple accounts exists."
+                )
             return self._accounts[self._default_account]
 
         if account in self._accounts:
@@ -632,7 +766,7 @@ class ezIBAsync:
         raise ValueError("Account %s not found in account list" % account)
 
     # ---------------------------------------
-    def _get_active_account(self, account = None):
+    def _get_active_account(self, account=None):
         """
         Get the active account to use.
 
@@ -641,21 +775,22 @@ class ezIBAsync:
             return self._default_account
 
         elif account not in self.accountCodes:
-            self._logger.warning(f"'{account}' not found in available accounts: {self.accountCodes}")
+            self._logger.warning(
+                f"'{account}' not found in available accounts: {self.accountCodes}"
+            )
             return None
             # raise ValueError("Account %s not found in account list" % account)
             # return None
 
         # if len(self._accounts) > 1:
-            # raise ValueError("Must specify account number as multiple accounts exists.")
-            # return self._accounts[list(self._accounts.keys())[0]]
-        
+        # raise ValueError("Must specify account number as multiple accounts exists.")
+        # return self._accounts[list(self._accounts.keys())[0]]
+
         return account
 
     # =============================================
     # Contracts Managment
     # =============================================
-
 
     # -----------------------------------------
     # tickerId/Symbols constructors
@@ -663,9 +798,9 @@ class ezIBAsync:
     def tickerId(self, contract_identifier):
         """
         Get the ticker ID for a contract or symbol.
-        
+
         If the contract or symbol doesn't have a ticker ID yet, a new one is assigned.
-        
+
         Args:
             contract_identifier: Contract object or symbol string
         """
@@ -673,17 +808,17 @@ class ezIBAsync:
         symbol = contract_identifier
         if isinstance(symbol, (Contract, tuple)):
             symbol = self.contractString(symbol)
-            
+
         # Check if symbol already has a ticker ID
         for tickerId, tickerSymbol in self.tickerIds.items():
             if symbol == tickerSymbol:
                 return tickerId
-                
+
         # Assign new ticker ID
         tickerId = len(self.tickerIds)
         self.tickerIds[tickerId] = symbol
         return tickerId
-        
+
     def tickerSymbol(self, tickerId):
         """
         Get the symbol for a ticker ID.
@@ -699,7 +834,7 @@ class ezIBAsync:
     def contract_to_tuple(contract):
         """
         Convert a contract object to a tuple representation.
-        
+
         Args:
             contract: Contract object
         """
@@ -710,71 +845,86 @@ class ezIBAsync:
             contract.currency,
             contract.lastTradeDateOrContractMonth,
             contract.strike,
-            contract.right
+            contract.right,
         )
 
-    def contractString(self, contract, separator = "_"):
+    def contractString(self, contract, separator="_"):
         """
         Convert a contract object or tuple to a string representation.
-        
+
         Args:
             contract: Contract object or tuple
             separator: Separator to use between contract elements
-            
+
         Returns:
             String representation of the contract
         """
         contractTuple = contract
-        
+
+        if not isinstance(contract, tuple):
+            contractTuple = self.contract_to_tuple(contract)
+
         try:
-            if not isinstance(contract, tuple):
-                contractTuple = self.contract_to_tuple(contract)
             if contractTuple[1] in ("OPT", "FOP"):
                 # Format strike price for options
-                strike = '{:0>5d}'.format(int(contractTuple[5])) + \
-                    format(contractTuple[5], '.3f').split('.')[1]
-                    
-                contractString = (contractTuple[0] + str(contractTuple[4]) +
-                                  contractTuple[6][0] + strike, contractTuple[1])
-                                  
+                strike = (
+                    "{:0>5d}".format(int(contractTuple[5]))
+                    + format(contractTuple[5], ".3f").split(".")[1]
+                )
+
+                contractString = (
+                    contractTuple[0]
+                    + str(contractTuple[4])
+                    + contractTuple[6][0]
+                    + strike,
+                    contractTuple[1],
+                )
+
             elif contractTuple[1] == "FUT":
                 # Format expiry for futures
                 exp = str(contractTuple[4])[:6]
                 month_codes = {
-                    1: 'F', 2: 'G', 3: 'H', 4: 'J', 5: 'K', 6: 'M',
-                    7: 'N', 8: 'Q', 9: 'U', 10: 'V', 11: 'X', 12: 'Z'
+                    1: "F",
+                    2: "G",
+                    3: "H",
+                    4: "J",
+                    5: "K",
+                    6: "M",
+                    7: "N",
+                    8: "Q",
+                    9: "U",
+                    10: "V",
+                    11: "X",
+                    12: "Z",
                 }
                 exp = month_codes[int(exp[4:6])] + exp[:4]
                 contractString = (contractTuple[0] + exp, contractTuple[1])
-                
+
             elif contractTuple[1] == "CASH":
                 contractString = (contractTuple[0] + contractTuple[3], contractTuple[1])
-                
+
             else:  # STK
                 contractString = (contractTuple[0], contractTuple[1])
-                
+
             # Construct string
-            contractString = separator.join(
-                str(v) for v in contractString).replace(separator + "STK", "")
-                
+            contractString = separator.join(str(v) for v in contractString).replace(
+                separator + "STK", ""
+            )
+
         except Exception as e:
             self._logger.error(f"Error converting contract to string: {e}")
-            # Fallback to contract.symbol if available, otherwise str(contract)
-            if hasattr(contract, 'symbol'):
-                contractString = contract.symbol
-            else:
-                contractString = str(contract)
-            
+            contractString = contractTuple[0]
+
         return contractString.replace(" ", "_").upper()
 
     # ---------------------------------------
     def contractDetails(self, contract_identifier):
         """
         Get contract details for a contract, symbol, or ticker ID.
-        
+
         Args:
             contract_identifier: Contract object, symbol string, or ticker ID
-            
+
         Returns:
             Dictionary of contract details
         """
@@ -787,132 +937,130 @@ class ezIBAsync:
                 tickerId = int(contract_identifier)
             else:
                 tickerId = self.tickerId(contract_identifier)
-                
+
         # Check if we have the contract details
-        if tickerId in self._contract_details:
-            return self._contract_details[tickerId]
-            
+        if tickerId in self.contract_details:
+            return self.contract_details[tickerId]
+
         # Default values if no details are available
         return {
-            'tickerId': tickerId,
-            'category': None, 
-            'contractMonth': '', 
-            'downloaded': False, 
-            'evMultiplier': 0,
-            'evRule': None, 
-            'industry': None, 
-            'liquidHours': '', 
-            'longName': '',
-            'marketName': '', 
-            'minTick': 0.01, 
-            'orderTypes': '', 
-            'priceMagnifier': 0,
-            'subcategory': None, 
-            'timeZoneId': '', 
-            'tradingHours': '', 
-            'underConId': 0,
-            'validExchanges': 'SMART', 
-            'contracts': [Contract()], 
-            'conId': 0,
-            'summary': {
-                'conId': 0, 
-                'currency': 'USD', 
-                'exchange': 'SMART', 
-                'lastTradeDateOrContractMonth': '',
-                'includeExpired': False, 
-                'localSymbol': '', 
-                'multiplier': '',
-                'primaryExch': None, 
-                'right': None, 
-                'secType': '',
-                'strike': 0.0, 
-                'symbol': '', 
-                'tradingClass': '',
-            }
+            "tickerId": 0,
+            "category": None,
+            "contractMonth": "",
+            "downloaded": False,
+            "evMultiplier": 0,
+            "evRule": None,
+            "industry": None,
+            "liquidHours": "",
+            "longName": "",
+            "marketName": "",
+            "minTick": 0.01,
+            "orderTypes": "",
+            "priceMagnifier": 0,
+            "subcategory": None,
+            "timeZoneId": "",
+            "tradingHours": "",
+            "underConId": 0,
+            "validExchanges": "SMART",
+            "contracts": [Contract()],
+            "conId": 0,
+            "summary": {
+                "conId": 0,
+                "currency": "USD",
+                "exchange": "SMART",
+                "lastTradeDateOrContractMonth": "",
+                "includeExpired": False,
+                "localSymbol": "",
+                "multiplier": "",
+                "primaryExch": None,
+                "right": None,
+                "secType": "",
+                "strike": 0.0,
+                "symbol": "",
+                "tradingClass": "",
+            },
         }
 
     # ---------------------------------------
     async def createContract(self, *args, **kwargs):
         """
         Create a contract from a tuple representation or parameters.
-        
+
         Args:
             *args: Contract parameters (symbol, sec_type, exchange, currency, lastTradeDateOrContractMonth, strike, right)
             **kwargs: Additional contract parameters
-            
+
         Returns:
             Created contract object
         """
-        try:
-            if len(args) == 1 and isinstance(args[0], Contract):
-                newContract = args[0]
-            else:
-                # Create a new Contract object
-                newContract = Contract()
-                newContract.symbol = args[0]
-                newContract.secType = args[1]
-                newContract.exchange = args[2] or "SMART"
-                newContract.currency = args[3] or "USD"
-                newContract.lastTradeDateOrContractMonth = args[4] or ""
-                newContract.strike = args[5] or 0.0
-                newContract.right = args[6] or ""
-                
-                if len(args) >= 8:
-                    newContract.multiplier = args[7]
-                    
-                # Include expired contracts for historical data
-                newContract.includeExpired = newContract.secType in ("FUT", "OPT", "FOP")
-            if "combo_legs" in kwargs:
-                newContract.comboLegs = kwargs["combo_legs"]
-                
-            # qualify this contract
-            qualified_contracts = await self.ib.qualifyContractsAsync(newContract)
-            
-            qualified_contract = qualified_contracts[0] if qualified_contracts else None
-            if not qualified_contract:
-                self._logger.warning(f'Unknown contract: {newContract}')
-                return None
+        if len(args) == 1 and isinstance(args[0], Contract):
+            newContract = args[0]
+        else:
+            # Create a new Contract object
+            newContract = Contract()
+            newContract.symbol = args[0]
+            newContract.secType = args[1]
+            newContract.exchange = args[2] or "SMART"
+            newContract.currency = args[3] or "USD"
+            newContract.lastTradeDateOrContractMonth = args[4] or ""
+            newContract.strike = args[5] or 0.0
+            newContract.right = args[6] or ""
 
-            # contractString = self.contractString(qualified_contract)
-            # tickerId = self.tickerId(contractString)
-            
-            contract = self.getContract(qualified_contract)
-            
-            if contract:
-                self._logger.debug(f"Contract: {qualified_contract} has been registered.")
-                return contract
+            if len(args) >= 8:
+                newContract.multiplier = args[7]
 
-            # Add contract to pool
-            self.contracts.append(qualified_contract)
+            # Include expired contracts for historical data
+            newContract.includeExpired = newContract.secType in ("FUT", "OPT", "FOP")
+        if "combo_legs" in kwargs:
+            newContract.comboLegs = kwargs["combo_legs"]
 
-            # Request contract details if not a combo contract
-            if "combo_legs" not in kwargs:
-                try:
-                    await self.requestContractDetails(qualified_contract)
-                    # await asyncio.sleep(1.5 if self.isMultiContract(newContract) else 0.5)
-                except KeyboardInterrupt:
-                    self._logger.warning("Contract details request interrupted")
-                    
-            return qualified_contract
-            
-        except (asyncio.TimeoutError, Exception) as e:
-            self._logger.error(f"Error creating contract: {e}")
-            return None
+        # qualify this contract
+        qualified_contracts = await self.ib.qualifyContractsAsync(newContract)
+
+        qualified_contract = qualified_contracts[0] if qualified_contracts else None
+        if not qualified_contract:
+            self._logger.warning(f"Unknown contract: {newContract}")
+            return
+
+        contractString = self.contractString(qualified_contract)
+        tickerId = self.tickerId(contractString)
+
+        contract = self.getContract(qualified_contract)
+
+        if contract:
+            self._logger.debug(f"Contract: {qualified_contract} has been registered.")
+            return contract
+
+        # Add contract to pool
+        # self.contracts.append(qualified_contract)
+        self.contracts[tickerId] = qualified_contract
+
+        # Request contract details if not a combo contract
+        if "combo_legs" not in kwargs:
+            try:
+                await self.requestContractDetails(qualified_contract)
+                # await asyncio.sleep(1.5 if self.isMultiContract(newContract) else 0.5)
+            except KeyboardInterrupt:
+                self._logger.warning("Contract details request interrupted")
+
+        return qualified_contract
 
     # ---------------------------------------
-    async def createStockContract(self, symbol, currency = "USD", exchange = "SMART"):
+    async def createStockContract(self, symbol, currency="USD", exchange="SMART"):
         """
         Create a stock contract.
 
         """
         contract = Stock(symbol=symbol, exchange=exchange, currency=currency)
         return await self.createContract(contract)
-    
+
     # -----------------------------------------
-    async def createFuturesContract(self, symbol, currency = "USD", expiry = None, exchange = "CME", multiplier = ""):
+    async def createFuturesContract(
+        self, symbol, currency="USD", expiry=None, exchange="CME", multiplier=""
+    ):
         """
         Create a futures contract.
-        
+
         Args:
             symbol: Futures symbol
             currency: Currency code
@@ -926,35 +1074,46 @@ class ezIBAsync:
         # Handle continuous futures
         if symbol and symbol[0] == "@":
             return await self.createContinuousFuturesContract(symbol[1:], exchange)
-            
+
         # Handle multiple expiries
         expiries = [expiry] if expiry and not isinstance(expiry, list) else expiry
-        
+
         if not expiries:
-            contract = Future(symbol=symbol, exchange=exchange, currency=currency, multiplier=multiplier)
+            contract = Future(
+                symbol=symbol,
+                exchange=exchange,
+                currency=currency,
+                multiplier=multiplier,
+            )
             return await self.createContract(contract)
-            
+
         contracts = []
         for fut_expiry in expiries:
-            contract = Future(symbol=symbol, lastTradeDateOrContractMonth=fut_expiry, 
-                             exchange=exchange, currency=currency, multiplier=multiplier)
+            contract = Future(
+                symbol=symbol,
+                lastTradeDateOrContractMonth=fut_expiry,
+                exchange=exchange,
+                currency=currency,
+                multiplier=multiplier,
+            )
             contract = await self.createContract(contract)
             contracts.append(contract)
-            
+
         return contracts[0] if len(contracts) == 1 else contracts
 
     # -----------------------------------------
-    async def createContinuousFuturesContract(self, symbol, exchange = "GLOBEX",
-                                          output = "contract", is_retry = False):
+    async def createContinuousFuturesContract(
+        self, symbol, exchange="GLOBEX", output="contract", is_retry=False
+    ):
         """
         Create a continuous futures contract.
-        
+
         Args:
             symbol: Futures symbol
             exchange: Exchange code
             output: Output type ('contract' or 'tuple')
             is_retry: Whether this is a retry attempt
-            
+
         Returns:
             Futures contract object or tuple
         """
@@ -964,45 +1123,62 @@ class ezIBAsync:
         contract.secType = "CONTFUT"
         contract.exchange = exchange
         contfut_contract = await self.createContract(contract)
-        
+
         # Wait for contract details
         for _ in range(25):
             # await asyncio.sleep(0.01)
             contfut = self.contract_details(contfut_contract)
             if contfut.get("tickerId", 0) != 0 and contfut.get("conId", 0) != 0:
                 break
-                
+
         # Can't find contract? Retry once
         if contfut.get("conId", 0) == 0:
             if not is_retry:
-                return await self.createContinuousFuturesContract(symbol, exchange, output, True,)
-            raise ValueError(f"Can't find a valid Contract using this combination ({symbol}/{exchange})")
-            
+                return await self.createContinuousFuturesContract(
+                    symbol,
+                    exchange,
+                    output,
+                    True,
+                )
+            raise ValueError(
+                f"Can't find a valid Contract using this combination ({symbol}/{exchange})"
+            )
+
         # Get contract details
         ticker_id = contfut.get("tickerId")
         expiry = contfut.get("contractMonth", "")
         currency = contfut.get("summary", {}).get("currency", "USD")
         multiplier = contfut.get("summary", {}).get("multiplier", "")
-        
+
         # Delete continuous placeholder
         if ticker_id in self.contracts:
             del self.contracts[ticker_id]
-        if ticker_id in self._contract_details:
-            del self._contract_details[ticker_id]
-            
+        if ticker_id in self.contract_details:
+            del self.contract_details[ticker_id]
+
         # Return tuple or contract
         if output == "tuple":
             return (symbol, "FUT", exchange, currency, expiry, 0.0, "", multiplier)
-            
-        return await self.createFuturesContract(symbol, currency, expiry, exchange, multiplier)
 
+        return await self.createFuturesContract(
+            symbol, currency, expiry, exchange, multiplier
+        )
 
     # -----------------------------------------
-    async def createOptionContract(self, symbol, expiry = None, strike = 0.0, otype = "C",
-                                  currency = "USD", sec_type = "OPT", exchange = "SMART", multiplier=""):
+    async def createOptionContract(
+        self,
+        symbol,
+        expiry=None,
+        strike=0.0,
+        otype="C",
+        currency="USD",
+        sec_type="OPT",
+        exchange="SMART",
+        multiplier="",
+    ):
         """
         Create an option contract.
-        
+
         Args:
             symbol: Underlying symbol
             expiry: Expiry date(s) in YYYYMMDD format
@@ -1011,7 +1187,7 @@ class ezIBAsync:
             currency: Currency code
             sec_type: Security type ('OPT' or 'FOP')
             exchange: Exchange code
-            
+
         Returns:
             Option contract object or list of contracts
         """
@@ -1019,67 +1195,78 @@ class ezIBAsync:
         expiries = [expiry] if expiry and not isinstance(expiry, list) else expiry
         strikes = [strike] if not isinstance(strike, list) else strike
         otypes = [otype] if not isinstance(otype, list) else otype
-        
+
         contracts = []
         for opt_expiry in expiries or [""]:
             for opt_strike in strikes or [0.0]:
                 for opt_otype in otypes or ["C"]:
-                    contract = Option(symbol=symbol, lastTradeDateOrContractMonth=opt_expiry,
-                                     strike=opt_strike, right=opt_otype, exchange=exchange,
-                                     multiplier=multiplier, currency=currency)
+                    contract = Option(
+                        symbol=symbol,
+                        lastTradeDateOrContractMonth=opt_expiry,
+                        strike=opt_strike,
+                        right=opt_otype,
+                        exchange=exchange,
+                        multiplier=multiplier,
+                        currency=currency,
+                    )
                     # Override secType if needed (for FOP)
                     if sec_type != "OPT":
                         contract.secType = sec_type
                     contract = await self.createContract(contract)
                     contracts.append(contract)
-                    
+
         return contracts[0] if len(contracts) == 1 else contracts
-        
-    async def createForexContract(self, symbol, currency = "USD", exchange = "IDEALPRO"):
+
+    async def createForexContract(self, symbol, currency="USD", exchange="IDEALPRO"):
         """
         Create a forex contract.
-        
+
         Args:
             symbol: Currency symbol (e.g., 'EUR' for EUR/USD)
             currency: Quote currency
             exchange: Exchange code
-            
+
         Returns:
             Forex contract object
         """
-        contract = Forex(pair=f'{symbol}{currency}', symbol=symbol, currency=currency, exchange=exchange)
+        contract = Forex(
+            pair=f"{symbol}{currency}",
+            symbol=symbol,
+            currency=currency,
+            exchange=exchange,
+        )
         return await self.createContract(contract)
-        
-    async def createIndexContract(self, symbol, currency = "USD", exchange = "CBOE"):
+
+    async def createIndexContract(self, symbol, currency="USD", exchange="CBOE"):
         """
         Create an index contract.
-        
+
         Args:
             symbol: Index symbol
             currency: Currency code
             exchange: Exchange code
-            
+
         Returns:
             Index contract object
         """
         contract = Index(symbol=symbol, exchange=exchange, currency=currency)
         return await self.createContract(contract)
-        
-    async def createComboLeg(self, contract, action, ratio = 1, exchange = None):
+
+    async def createComboLeg(self, contract, action, ratio=1, exchange=None):
         """
         Create a combo leg for a combo contract.
-        
+
         Args:
             contract: Contract for the leg
             action: Action ('BUY' or 'SELL')
             ratio: Leg ratio
             exchange: Exchange code (defaults to contract's exchange)
-            
+
         Returns:
             ComboLeg object
         """
         leg = ComboLeg()
-        
+
         # Get contract ID
         loops = 0
         con_id = 0
@@ -1087,7 +1274,7 @@ class ezIBAsync:
             con_id = self.getConId(contract)
             loops += 1
             await asyncio.sleep(0.05)
-            
+
         leg.conId = con_id
         leg.ratio = abs(ratio)
         leg.action = action
@@ -1095,19 +1282,19 @@ class ezIBAsync:
         leg.openClose = 0
         leg.shortSaleSlot = 0
         leg.designatedLocation = ""
-        
+
         return leg
-        
-    async def createComboContract(self, symbol, legs, currency = "USD", exchange = None):
+
+    async def createComboContract(self, symbol, legs, currency="USD", exchange=None):
         """
         Create a combo contract with multiple legs.
-        
+
         Args:
             symbol: Symbol for the combo
             legs: List of ComboLeg objects
             currency: Currency code
             exchange: Exchange code (defaults to first leg's exchange)
-            
+
         Returns:
             Combo contract object
         """
@@ -1121,12 +1308,22 @@ class ezIBAsync:
         return await self.createContract(contract)
 
     # ---------------------------------------
-    def createOrder(self, quantity, price=0., stop=0., tif="DAY",
-                fillorkill=False, iceberg=False, transmit=True, rth=False,
-                account=None, **kwargs):
+    def createOrder(
+        self,
+        quantity,
+        price=0.0,
+        stop=0.0,
+        tif="DAY",
+        fillorkill=False,
+        iceberg=False,
+        transmit=True,
+        rth=False,
+        account=None,
+        **kwargs,
+    ):
         """
         Create a trading order
-        
+
         Parameters:
             quantity: Order quantity, positive for buy, negative for sell
             price: Limit price, 0 for market order
@@ -1138,18 +1335,18 @@ class ezIBAsync:
             rth: Whether order is valid only during regular trading hours
             account: Trading account
             **kwargs: Additional parameters
-        
+
         Returns:
             Order object
         """
-        
+
         # Create order object
         order = Order()
-        
+
         # Set order direction and quantity
         order.action = "BUY" if quantity > 0 else "SELL"
         order.totalQuantity = abs(int(quantity))
-        
+
         # Set order type
         if "orderType" in kwargs:
             order.orderType = kwargs["orderType"]
@@ -1161,35 +1358,37 @@ class ezIBAsync:
                 tif = "OPG"
         else:
             order.orderType = "MKT" if price == 0 else "LMT"
-        
+
         # Set prices
         order.lmtPrice = price  # Limit price
-        order.auxPrice = kwargs["auxPrice"] if "auxPrice" in kwargs else stop  # Stop price
-        
+        order.auxPrice = (
+            kwargs["auxPrice"] if "auxPrice" in kwargs else stop
+        )  # Stop price
+
         # Set time-in-force and execution conditions
-        order.tif = tif.upper()  
+        order.tif = tif.upper()
         order.allOrNone = bool(fillorkill)
         order.hidden = bool(iceberg)
         order.transmit = bool(transmit)
         order.outsideRth = bool(rth == False and tif.upper() != "OPG")
-        
+
         # Set account
         account_code = self._get_active_account(account)
         if account_code is not None:
             order.account = account_code
-        
+
         # Iceberg order display quantity
         if iceberg and ("blockOrder" in kwargs):
             order.blockOrder = kwargs["blockOrder"]
-        
+
         # Relative order percentage offset
         if "percentOffset" in kwargs:
             order.percentOffset = kwargs["percentOffset"]
-        
+
         # Parent order ID, used for bracket orders and trailing stops
         if "parentId" in kwargs:
             order.parentId = kwargs["parentId"]
-        
+
         # OCA group (Order Cancels All), used for bracket orders and trailing stops
         if "ocaGroup" in kwargs:
             order.ocaGroup = kwargs["ocaGroup"]
@@ -1197,76 +1396,66 @@ class ezIBAsync:
                 order.ocaType = kwargs["ocaType"]
             else:
                 order.ocaType = 2  # Proportionally reduce remaining orders' size
-        
+
         # Trailing stop order
         if "trailingPercent" in kwargs:
             order.trailingPercent = kwargs["trailingPercent"]
-        
+
         # Trailing limit stop order
         if "trailStopPrice" in kwargs:
             order.trailStopPrice = kwargs["trailStopPrice"]
-        
+
         return order
-    
+
     # ---------------------------------------
     def placeOrder(self, contract, order, orderId=None, account=None):
-        """ 
+        """
         Place order on IB TWS
-        
+
         Parameters:
             contract: Contract object
             order: Order object
             orderId: Order ID, uses current orderId if None
             account: Account code
-            
+
         Returns:
             Order ID
         """
-        try:
-            # Handle None contract
-            if contract is None:
-                self._logger.error("Cannot place order with None contract")
-                return None
-                
-            # Ensure prices conform to contract's minimum tick size
-            ticksize = self.contractDetails(contract)["minTick"]
-            order.lmtPrice = self.roundClosestValid(order.lmtPrice, ticksize)
-            order.auxPrice = self.roundClosestValid(order.auxPrice, ticksize)
-            
-            # Set account
-            account_code = self._get_active_account(account)
-            if account_code is not None:
-                order.account = account_code
-            
-            # Use ib_async's placeOrder method
-            trade = self.ib.placeOrder(contract, order)
-            # trade.statusEvent += self._on_order_status
+        # Ensure prices conform to contract's minimum tick size
+        ticksize = self.contractDetails(contract)["minTick"]
+        order.lmtPrice = self.roundClosestValid(order.lmtPrice, ticksize)
+        order.auxPrice = self.roundClosestValid(order.auxPrice, ticksize)
 
-            # self.ib.sleep(0.1)
-            
-            # Record order information
-            self.orders[order.orderId] = {
-                "id":           order.orderId,
-                "symbol":       self.contractString(contract),
-                "contract":     contract,
-                "status":       "SENT",
-                "reason":       None,
-                "avgFillPrice": 0.,
-                "parentId":     0,
-                # "time":         datetime.fromtimestamp(int(self.time)),
-                "account":      None
-            }
-            
-            # Record account information
-            if hasattr(order, "account"):
-                self.orders[order.orderId]["account"] = order.account
-            
-            # Return order ID
-            return trade
-            
-        except Exception as e:
-            self._logger.error(f"Error placing order: {e}")
-            return None
+        # Set account
+        account_code = self._get_active_account(account)
+        if account_code is not None:
+            order.account = account_code
+
+        # Use ib_async's placeOrder method
+        trade = self.ib.placeOrder(contract, order)
+        # trade.statusEvent += self._on_order_status
+
+        # self.ib.sleep(0.1)
+
+        # Record order information
+        self.orders[order.orderId] = {
+            "id": order.orderId,
+            "symbol": self.contractString(contract),
+            "contract": contract,
+            "status": "SENT",
+            "reason": None,
+            "avgFillPrice": 0.0,
+            "parentId": 0,
+            # "time":         datetime.fromtimestamp(int(self.time)),
+            "account": None,
+        }
+
+        # Record account information
+        if hasattr(order, "account"):
+            self.orders[order.orderId]["account"] = order.account
+
+        # Return order ID
+        return trade
 
     # ---------------------------------------
     async def requestContractDetails(self, contract):
@@ -1277,15 +1466,15 @@ class ezIBAsync:
         tickerId = self.tickerId(contract)
         try:
             details = await self.ib.reqContractDetailsAsync(contract)
-            
+
             if not details:
                 self._logger.warning(f"No contract details returned for {contract}")
                 return
-                
-            self._contract_details.append(*details)
+
+            # self._contract_details.append(*details)
             # Process contract details
-            # await self._handle_contract_details(tickerId, details)
-            
+            await self._handle_contract_details(tickerId, details)
+
         except Exception as e:
             self._logger.error(f"Error requesting contract details: {e}")
 
@@ -1293,159 +1482,167 @@ class ezIBAsync:
     async def _handle_contract_details(self, tickerId, details):
         """
         Process contract details received from IB API.
-        
+
         Args:
             tickerId: Ticker ID for the contract
             details: List of ContractDetails objects
         """
         if not details:
             return
-            
+
         # Create a dictionary to store contract details
         details_dict = {
-            'tickerId': tickerId,
-            'downloaded': True,
-            'contracts': [detail.contract for detail in details],
-            'conId': details[0].contract.conId,
-            'contractMonth': details[0].contractMonth,
-            'industry': details[0].industry,
-            'category': details[0].category,
-            'subcategory': details[0].subcategory,
-            'timeZoneId': details[0].timeZoneId,
-            'tradingHours': details[0].tradingHours,
-            'liquidHours': details[0].liquidHours,
-            'evRule': details[0].evRule,
-            'evMultiplier': details[0].evMultiplier,
-            'minTick': details[0].minTick,
-            'orderTypes': details[0].orderTypes,
-            'validExchanges': details[0].validExchanges,
-            'priceMagnifier': details[0].priceMagnifier,
-            'underConId': details[0].underConId,
-            'longName': details[0].longName,
-            'marketName': details[0].marketName,
+            "tickerId": tickerId,
+            "downloaded": True,
+            "contracts": [detail.contract for detail in details],
+            "conId": details[0].contract.conId,
+            "contractMonth": details[0].contractMonth,
+            "industry": details[0].industry,
+            "category": details[0].category,
+            "subcategory": details[0].subcategory,
+            "timeZoneId": details[0].timeZoneId,
+            "tradingHours": details[0].tradingHours,
+            "liquidHours": details[0].liquidHours,
+            "evRule": details[0].evRule,
+            "evMultiplier": details[0].evMultiplier,
+            "minTick": details[0].minTick,
+            "orderTypes": details[0].orderTypes,
+            "validExchanges": details[0].validExchanges,
+            "priceMagnifier": details[0].priceMagnifier,
+            "underConId": details[0].underConId,
+            "longName": details[0].longName,
+            "marketName": details[0].marketName,
         }
-        
+
         # Add summary information
         if len(details) > 1:
-            details_dict['contractMonth'] = ""
+            details_dict["contractMonth"] = ""
             # Use closest expiration as summary
             expirations = await self.getExpirations(self.contracts[tickerId])
             if expirations:
-                contract = details_dict['contracts'][-len(expirations)]
-                details_dict['summary'] = vars(contract)
+                contract = details_dict["contracts"][-len(expirations)]
+                details_dict["summary"] = vars(contract)
             else:
-                details_dict['summary'] = vars(details_dict['contracts'][0])
+                details_dict["summary"] = vars(details_dict["contracts"][0])
         else:
-            details_dict['summary'] = vars(details_dict['contracts'][0])
-            
+            details_dict["summary"] = vars(details_dict["contracts"][0])
+
         # Store contract details
-        self._contract_details[tickerId] = details_dict
-        
+        self.contract_details[tickerId] = details_dict
+
         # Add local symbol mapping
         for detail in details:
             contract = detail.contract
-            if contract.localSymbol and contract.localSymbol not in self.localSymbolExpiry:
+            if (
+                contract.localSymbol
+                and contract.localSymbol not in self.localSymbolExpiry
+            ):
                 self.localSymbolExpiry[contract.localSymbol] = detail.contractMonth
-                
+
         # Add contracts to the contracts dictionary
-        for contract in details_dict['contracts']:
+        for contract in details_dict["contracts"]:
             contract_string = self.contractString(contract)
             contract_ticker_id = self.tickerId(contract_string)
             self.contracts[contract_ticker_id] = contract
-            
+
             # If this is a different ticker ID than the original, create a separate entry
             if contract_ticker_id != tickerId:
                 contract_details = details_dict.copy()
-                contract_details['summary'] = vars(contract)
-                contract_details['contracts'] = [contract]
-                self._contract_details[contract_ticker_id] = contract_details
+                contract_details["summary"] = vars(contract)
+                contract_details["contracts"] = [contract]
+                self.contract_details[contract_ticker_id] = contract_details
+
+        # self.contract_details = self._contract_details
 
     # -----------------------------------------
     def getConId(self, contract):
         """
         Get the contract ID for a contract, symbol, or ticker ID.
-        
+
         Args:
             contract_identifier: Contract object, symbol string, or ticker ID
-            
+
         Returns:
             Contract ID
         """
-        for c in self.contracts:
+        for c in self.contracts.values():
             if contract.conId == c.conId:
                 return c.conId
-        
+
         return 0
 
         # details = self.contractDetails(contract_identifier)
         # return details.get("conId", 0)
-    
+
     # -----------------------------------------
     def getContract(self, contract):
         """
         Get the contract ID for a contract, symbol, or ticker ID.
-        
+
         Args:
             contract_identifier: Contract object, symbol string, or ticker ID
-            
+
         Returns:
             Contract ID
         """
-        for c in self.contracts:
+        for c in self.contracts.values():
             if contract.conId == c.conId:
                 return c
-        
+
         return None
 
     # -----------------------------------------
     def isMultiContract(self, contract):
         """
         Check if a contract has multiple sub-contracts with different expiries/strikes/sides.
-        
+
         """
         # Futures with no expiry
         if contract.secType == "FUT" and not contract.lastTradeDateOrContractMonth:
             return True
-            
+
         # Options with missing fields
         if contract.secType in ("OPT", "FOP") and (
-            not contract.lastTradeDateOrContractMonth or 
-            not contract.strike or 
-            not contract.right
+            not contract.lastTradeDateOrContractMonth
+            or not contract.strike
+            or not contract.right
         ):
             return True
-            
+
         # Check if we have multiple contracts in the details
         tickerId = self.tickerId(contract)
-        if tickerId in self._contract_details and len(self._contract_details[tickerId]["contracts"]) > 1:
+        if (
+            tickerId in self.contract_details
+            and len(self.contract_details[tickerId]["contracts"]) > 1
+        ):
             return True
-            
+
         return False
 
     # -----------------------------------------
-    async def getExpirations(self, contract_identifier, expired = 0):
+    async def getExpirations(self, contract_identifier, expired=0):
         """
         Get available expirations for a contract.
-        
+
         Args:
             contract_identifier: Contract object, symbol string, or ticker ID
             expired: Number of expired contracts to include (0 = none)
-            
+
         Returns:
             Tuple of expiration dates as integers (YYYYMMDD)
         """
         details = self.contractDetails(contract_identifier)
         contracts = details.get("contracts", [])
-     
+
         if not contracts or contracts[0].secType not in ("FUT", "FOP", "OPT"):
             return tuple()
-            
+
         # Collect expirations
         expirations = []
         for contract in contracts:
             if contract.lastTradeDateOrContractMonth:
                 expirations.append(int(contract.lastTradeDateOrContractMonth))
-                
+
         # Remove expired contracts
         today = int(datetime.now().strftime("%Y%m%d"))
         if expirations:
@@ -1453,46 +1650,46 @@ class ezIBAsync:
             idx = expirations.index(closest) - expired
             if idx >= 0:
                 expirations = expirations[idx:]
-            
+
         return tuple(sorted(expirations))
 
     # -----------------------------------------
-    async def getStrikes(self, contract_identifier, smin = None, smax = None):
+    async def getStrikes(self, contract_identifier, smin=None, smax=None):
         """
         Get available strikes for an option contract.
-        
+
         Args:
             contract_identifier: Contract object, symbol string, or ticker ID
             smin: Minimum strike price
             smax: Maximum strike price
-            
+
         Returns:
             Tuple of strike prices
         """
         details = self.contractDetails(contract_identifier)
         contracts = details.get("contracts", [])
-        
+
         if not contracts or contracts[0].secType not in ("FOP", "OPT"):
             return tuple()
-            
+
         # Collect strikes
         strikes = []
         for contract in contracts:
             strikes.append(contract.strike)
-            
+
         # Filter by min/max
         if smin is not None or smax is not None:
             smin = smin if smin is not None else 0
-            smax = smax if smax is not None else float('inf')
+            smax = smax if smax is not None else float("inf")
             strikes = [s for s in strikes if smin <= s <= smax]
-            
+
         return tuple(sorted(strikes))
-    
+
     # -----------------------------------------
     async def registerContract(self, contract):
         """
         Register a contract that was received from a callback.
-        
+
         Args:
             contract: Contract object to register
         """
@@ -1500,22 +1697,19 @@ class ezIBAsync:
             if self.getConId(contract) == 0:
                 # contract_tuple = self.contract_to_tuple(contract)
                 # add timeout
-                await asyncio.wait_for(
-                    self.createContract(contract),
-                    timeout=10.0
-                )
+                await asyncio.wait_for(self.createContract(contract), timeout=10.0)
         except asyncio.TimeoutError:
             self._logger.error(f"Contract registration timed out: {contract}")
         except Exception as e:
-            self._logger.error(f"Error registering contract: {str(e)}")
-    
+            self._logger.error(f"Error registering {contract.symbol}: {str(e)}")
+
     # -----------------------------------------
     # Position handling
     # -----------------------------------------
     def _onPositionUpdateHandler(self, position):
         """
         Handle position updates from IB.
-        
+
         Args:
             position: Position object from IB
         """
@@ -1523,30 +1717,26 @@ class ezIBAsync:
             # contract identifier
             contract_tuple = self.contract_to_tuple(position.contract)
             contractString = self.contractString(contract_tuple)
-            
-            # try creating the contract (only if event loop is running)
-            try:
-                asyncio.create_task(self.registerContract(position.contract))
-            except RuntimeError:
-                # No event loop running, skip async registration
-                pass
+
+            # try creating the contract
+            asyncio.create_task(self.registerContract(position.contract))
             # self._logger.debug(f"Position of contract: {position.contract} updated.")
-            
+
             # Get symbol
             symbol = position.contract.symbol
-            
+
             # Create account entry if it doesn't exist
             if position.account not in self._positions:
                 self._positions[position.account] = {}
-                
+
             # Create or update position
             self._positions[position.account][contractString] = {
                 "symbol": contractString,
                 "position": position.position,
                 "avgCost": position.avgCost,
-                "account": position.account
+                "account": position.account,
             }
-                
+
             # If position is zero, remove the position entry
             # if position.position == 0:
             #     if contractString in self._positions[position.account]:
@@ -1556,8 +1746,9 @@ class ezIBAsync:
             # Update position
             # self._positions[position.account][contractString] = position
             self._logger.debug(
-                f"Updated position for {position.account}: {symbol} = {position.position} @ {position.avgCost}")
-            
+                f"Updated position for {position.account}: {symbol} = {position.position} @ {position.avgCost}"
+            )
+
         except Exception as e:
             self._logger.error(f"Error handling position update: {e}")
 
@@ -1567,11 +1758,11 @@ class ezIBAsync:
     # @property
     # def positions(self):
     #     return self.getPositions()
-    
+
     @property
     def positions(self):
         return self._positions
-    
+
     @property
     def position(self):
         return self.getPosition()
@@ -1584,19 +1775,13 @@ class ezIBAsync:
 
         if account is None:
             if len(self._positions) > 1:
-                raise ValueError("Must specify account number as multiple accounts exists.")
-            account_data = self._positions[list(self._positions.keys())[0]]
-            # Validate that the data is properly formatted
-            if not isinstance(account_data, dict):
-                raise ValueError("Position data is corrupted - expected dict but got %s" % type(account_data))
-            return account_data
+                raise ValueError(
+                    "Must specify account number as multiple accounts exists."
+                )
+            return self._positions[list(self._positions.keys())[0]]
 
         if account in self._positions:
-            account_data = self._positions[account]
-            # Validate that the data is properly formatted
-            if not isinstance(account_data, dict):
-                raise ValueError("Position data is corrupted - expected dict but got %s" % type(account_data))
-            return account_data
+            return self._positions[account]
 
         raise ValueError("Account %s not found in account list" % account)
 
@@ -1606,7 +1791,7 @@ class ezIBAsync:
     def _onPortfolioUpdateHandler(self, portfolio):
         """
         Handle portfolio updates from IB.
-        
+
         Args:
             portfolio: PortfolioItem objects from IB
         """
@@ -1614,21 +1799,21 @@ class ezIBAsync:
             # contract identifier
             contract_tuple = self.contract_to_tuple(portfolio.contract)
             contractString = self.contractString(contract_tuple)
-            
+
             # try creating the contract
             # asyncio.create_task(self.registerContract(portfolio.contract))
-            
+
             # Get symbol
             symbol = portfolio.contract.symbol
-            
+
             # Create account entry if it doesn't exist
             if portfolio.account not in self._portfolios:
                 self._portfolios[portfolio.account] = {}
                 # self._portfolios_items[portfolio.account] = []
-                
+
             # Calculate total P&L
             total_pnl = portfolio.unrealizedPNL + portfolio.realizedPNL
-            
+
             # Create or update portfolio item
             # self._portfolios[portfolio.account][contractString] = portfolio
             self._portfolios[portfolio.account][contractString] = {
@@ -1640,23 +1825,23 @@ class ezIBAsync:
                 "unrealizedPNL": portfolio.unrealizedPNL,
                 "realizedPNL": portfolio.realizedPNL,
                 "totalPNL": total_pnl,
-                "account": portfolio.account
+                "account": portfolio.account,
             }
             # self._portfolios_items[portfolio.account].append(portfolio)
-            
+
             self._logger.debug(
-                f"Updated portfolio for {portfolio.account}: {symbol} = {portfolio.position} @ {portfolio.marketPrice}")
+                f"Updated portfolio for {portfolio.account}: {symbol} = {portfolio.position} @ {portfolio.marketPrice}"
+            )
 
             # TODO:fire callback
             # self.ibCallback(caller="handlePortfolio", msg=portfolio)
-            
+
         except Exception as e:
             self._logger.error(f"Error handling portfolio update: {e}")
 
     @property
     def portfolios(self):
         return self._portfolios
-    
 
     @property
     def portfolio(self):
@@ -1683,12 +1868,21 @@ class ezIBAsync:
     # -----------------------------------------
     # Order Creation Methods
     # -----------------------------------------
-    def createTargetOrder(self, quantity, parentId=0,
-            target=0., orderType=None, transmit=True, group=None, tif="DAY",
-            rth=False, account=None):
-        """ 
-        Creates TARGET order 
-        
+    def createTargetOrder(
+        self,
+        quantity,
+        parentId=0,
+        target=0.0,
+        orderType=None,
+        transmit=True,
+        group=None,
+        tif="DAY",
+        rth=False,
+        account=None,
+    ):
+        """
+        Creates TARGET order
+
         Args:
             quantity: Order quantity
             parentId: Parent order ID
@@ -1699,7 +1893,7 @@ class ezIBAsync:
             tif: Time-in-force
             rth: Whether order is valid only during regular trading hours
             account: Trading account
-            
+
         Returns:
             Order object
         """
@@ -1712,25 +1906,37 @@ class ezIBAsync:
             "parentId": parentId,
             "rth": rth,
             "tif": tif,
-            "account": self._get_active_account(account)
+            "account": self._get_active_account(account),
         }
-        
+
         # default order type is "Market if Touched"
         if orderType is None:
-            params['orderType'] = "MIT"
-            params['auxPrice'] = target
-            del params['price']
+            params["orderType"] = "MIT"
+            params["auxPrice"] = target
+            del params["price"]
 
         order = self.createOrder(**params)
         return order
 
     # -----------------------------------------
-    def createStopOrder(self, quantity, parentId=0, stop=0., trail=None,
-            transmit=True, trigger=None, group=None, stop_limit=False,
-            rth=False, tif="DAY", account=None, **kwargs):
-        """ 
-        Creates STOP order 
-        
+    def createStopOrder(
+        self,
+        quantity,
+        parentId=0,
+        stop=0.0,
+        trail=None,
+        transmit=True,
+        trigger=None,
+        group=None,
+        stop_limit=False,
+        rth=False,
+        tif="DAY",
+        account=None,
+        **kwargs,
+    ):
+        """
+        Creates STOP order
+
         Args:
             quantity: Order quantity
             parentId: Parent order ID
@@ -1744,7 +1950,7 @@ class ezIBAsync:
             tif: Time-in-force
             account: Trading account
             **kwargs: Additional parameters
-            
+
         Returns:
             Order object
         """
@@ -1774,40 +1980,49 @@ class ezIBAsync:
             "parentId": parentId,
             "rth": rth,
             "tif": tif,
-            "account": self._get_active_account(account)
+            "account": self._get_active_account(account),
         }
 
         if trail:
-            order_data['orderType'] = "TRAIL"
+            order_data["orderType"] = "TRAIL"
             if "orderType" in kwargs:
-                order_data['orderType'] = kwargs["orderType"]
+                order_data["orderType"] = kwargs["orderType"]
             elif stop_limit:
-                order_data['orderType'] = "TRAIL LIMIT"
+                order_data["orderType"] = "TRAIL LIMIT"
 
             if trail == "percent":
-                order_data['trailingPercent'] = stop
+                order_data["trailingPercent"] = stop
             else:
-                order_data['auxPrice'] = stop
+                order_data["auxPrice"] = stop
         else:
-            order_data['orderType'] = "STP"
+            order_data["orderType"] = "STP"
             if stop_limit:
-                order_data['orderType'] = "STP LMT"
+                order_data["orderType"] = "STP LMT"
 
         order = self.createOrder(**order_data)
         return order
-    
+
     # -----------------------------------------
-    def createTriggerableTrailingStop(self, symbol, quantity=1,
-            triggerPrice=0, trailPercent=100., trailAmount=0.,
-            parentId=0, stopOrderId=None, targetOrderId=None,
-            account=None, **kwargs):
+    def createTriggerableTrailingStop(
+        self,
+        symbol,
+        quantity=1,
+        triggerPrice=0,
+        trailPercent=100.0,
+        trailAmount=0.0,
+        parentId=0,
+        stopOrderId=None,
+        targetOrderId=None,
+        account=None,
+        **kwargs,
+    ):
         """
         Adds order to triggerable list
-        
+
         IMPORTANT! For trailing stop to work you'll need
             1. real time market data subscription for the tracked ticker
             2. the python/algo script to be kept alive
-            
+
         Args:
             symbol: Contract symbol
             quantity: Order quantity
@@ -1819,12 +2034,12 @@ class ezIBAsync:
             targetOrderId: Target order ID
             account: Trading account
             **kwargs: Additional parameters
-            
+
         Returns:
             Dictionary with trailing stop parameters
         """
         # Initialize the triggerableTrailingStops dictionary if it doesn't exist
-        if not hasattr(self, 'triggerableTrailingStops'):
+        if not hasattr(self, "triggerableTrailingStops"):
             self.triggerableTrailingStops = {}
 
         ticksize = self.contractDetails(symbol)["minTick"]
@@ -1838,183 +2053,142 @@ class ezIBAsync:
             "trailPercent": abs(trailPercent),
             "quantity": quantity,
             "ticksize": ticksize,
-            "account": self._get_active_account(account)
+            "account": self._get_active_account(account),
         }
 
         return self.triggerableTrailingStops[symbol]
 
     # -----------------------------------------
-    def createBracketOrder(self, contract, quantity,
-                entry=0., target=0., stop=0.,
-                targetType=None, stopType=None,
-                trailingStop=False,  # (pct/amt/False)
-                trailingValue=None,  # value to train by (amt/pct)
-                trailingTrigger=None,  # (price where hard stop starts trailing)
-                group=None, tif="DAY",
-                fillorkill=False, iceberg=False, rth=False,
-                transmit=True, account=None, **kwargs):
-            """
-            Creates One Cancels All Bracket Order
-            
-            Args:
-                contract: Contract object
-                quantity: Order quantity
-                entry: Entry price (0 for market order)
-                target: Target/profit price (0 to disable)
-                stop: Stop/loss price (0 to disable)
-                targetType: Target order type
-                stopType: Stop order type
-                trailingStop: Trailing stop type ('pct', 'amt', or False)
-                trailingValue: Value to trail by (amount or percentage)
-                trailingTrigger: Price where hard stop starts trailing
-                group: OCA group name
-                tif: Time-in-force
-                fillorkill: Whether to use fill-or-kill
-                iceberg: Whether to use iceberg order
-                rth: Whether order is valid only during regular trading hours
-                transmit: Whether to transmit the order
-                account: Trading account
-                **kwargs: Additional parameters
-                
-            Returns:
-                Dictionary with order IDs
-            """
-            import time
-            
-            if group is None:
-                group = "bracket_" + str(int(time.time()))
-
-            account = self._get_active_account(account)
-
-            # main order
-            entryOrder = self.createOrder(quantity, price=entry, transmit=False,
-                            tif=tif, fillorkill=fillorkill, iceberg=iceberg,
-                            rth=rth, account=account, **kwargs)
-
-            trade = self.placeOrder(contract, entryOrder)
-            if trade is None:
-                self._logger.error("Failed to place entry order for bracket order")
-                return None
-            entryOrderId = trade.order.orderId
-
-            # target
-            targetOrderId = 0
-            if target > 0 or targetType == "MOC":
-                targetOrder = self.createTargetOrder(-quantity,
-                                parentId=entryOrderId,
-                                target=target,
-                                transmit=False if stop > 0 else True,
-                                orderType=targetType,
-                                group=group,
-                                rth=rth,
-                                tif=tif,
-                                account=account
-                            )
-
-                targetTrade = self.placeOrder(contract, targetOrder)
-                if targetTrade is None:
-                    self._logger.error("Failed to place target order for bracket order")
-                    targetOrderId = 0
-                else:
-                    targetOrderId = targetTrade.order.orderId
-
-            # stop
-            stopOrderId = 0
-            if stop > 0:
-                stop_limit = stopType and stopType.upper() in ["LIMIT", "LMT"]
-                
-                stopOrder = self.createStopOrder(-quantity,
-                                parentId=entryOrderId,
-                                stop=stop,
-                                trail=None,
-                                transmit=transmit,
-                                group=group,
-                                rth=rth,
-                                tif=tif,
-                                stop_limit=stop_limit,
-                                account=account
-                            )
-
-                stopTrade = self.placeOrder(contract, stopOrder)
-                if stopTrade is None:
-                    self._logger.error("Failed to place stop order for bracket order")
-                    stopOrderId = 0
-                else:
-                    stopOrderId = stopTrade.order.orderId
-
-                # triggered trailing stop?
-                if trailingStop and trailingTrigger and trailingValue:
-                    trailing_params = {
-                        "symbol": self.contractString(contract),
-                        "quantity": -quantity,
-                        "triggerPrice": trailingTrigger,
-                        "parentId": entryOrderId,
-                        "stopOrderId": stopOrderId,
-                        "targetOrderId": targetOrderId if targetOrderId != 0 else None,
-                        "account": account
-                    }
-                    if trailingStop.lower() in ['amt', 'amount']:
-                        trailing_params["trailAmount"] = trailingValue
-                    elif trailingStop.lower() in ['pct', 'percent']:
-                        trailing_params["trailPercent"] = trailingValue
-
-                    self.createTriggerableTrailingStop(**trailing_params)
-
-            return {
-                "group": group,
-                "entryOrderId": entryOrderId,
-                "targetOrderId": targetOrderId,
-                "stopOrderId": stopOrderId
-            }
-
-    # -----------------------------------------
-    def _handleTickOptionComputation(self, ticker_id, computation, col_prepend=""):
+    def createBracketOrder(
+        self,
+        contract,
+        quantity,
+        entry=0.0,
+        target=0.0,
+        stop=0.0,
+        targetType=None,
+        stopType=None,
+        trailingStop=False,  # (pct/amt/False)
+        trailingValue=None,  # value to train by (amt/pct)
+        trailingTrigger=None,  # (price where hard stop starts trailing)
+        group=None,
+        tif="DAY",
+        fillorkill=False,
+        iceberg=False,
+        rth=False,
+        transmit=True,
+        account=None,
+        **kwargs,
+    ):
         """
-        Handle option computation data (Greeks) from IB.
-        
+        Creates One Cancels All Bracket Order
+
         Args:
-            ticker_id: The ticker ID for the option
-            computation: Option computation object with Greeks data
-            col_prepend: Prefix for column names (last_, bid_, ask_)
-            
-        Reference:
-        https://www.interactivebrokers.com/en/software/api/apiguide/java/tickoptioncomputation.htm
+            contract: Contract object
+            quantity: Order quantity
+            entry: Entry price (0 for market order)
+            target: Target/profit price (0 to disable)
+            stop: Stop/loss price (0 to disable)
+            targetType: Target order type
+            stopType: Stop order type
+            trailingStop: Trailing stop type ('pct', 'amt', or False)
+            trailingValue: Value to trail by (amount or percentage)
+            trailingTrigger: Price where hard stop starts trailing
+            group: OCA group name
+            tif: Time-in-force
+            fillorkill: Whether to use fill-or-kill
+            iceberg: Whether to use iceberg order
+            rth: Whether order is valid only during regular trading hours
+            transmit: Whether to transmit the order
+            account: Trading account
+            **kwargs: Additional parameters
+
+        Returns:
+            Dictionary with order IDs
         """
-        
-        def calc_generic_val(data, field):
-            """Calculate generic value from last, bid, ask data."""
-            last_val = data["last_" + field].values[-1]
-            bid_val = data["bid_" + field].values[-1]
-            ask_val = data["ask_" + field].values[-1]
-            bid_ask_val = last_val
+        import time
 
-            if bid_val is not None and ask_val is not None:
-                bid_ask_val = (bid_val + ask_val) / 2
+        if group is None:
+            group = "bracket_" + str(int(time.time()))
 
-            if last_val is not None:
-                return max([last_val, bid_ask_val])
+        account = self._get_active_account(account)
 
-            return bid_ask_val
+        # main order
+        entryOrder = self.createOrder(
+            quantity,
+            price=entry,
+            transmit=False,
+            tif=tif,
+            fillorkill=fillorkill,
+            iceberg=iceberg,
+            rth=rth,
+            account=account,
+            **kwargs,
+        )
 
-        # Ensure ticker exists in options data
-        if ticker_id not in self.optionsData:
-            self.optionsData[ticker_id] = self.optionsData[0].copy()
+        trade = self.placeOrder(contract, entryOrder)
+        entryOrderId = trade.order.orderId
 
-        # Save side-specific values
-        self.optionsData[ticker_id][col_prepend + "imp_vol"] = computation.impliedVol
-        self.optionsData[ticker_id][col_prepend + "dividend"] = computation.pvDividend
-        self.optionsData[ticker_id][col_prepend + "delta"] = computation.delta
-        self.optionsData[ticker_id][col_prepend + "gamma"] = computation.gamma
-        self.optionsData[ticker_id][col_prepend + "vega"] = computation.vega
-        self.optionsData[ticker_id][col_prepend + "theta"] = computation.theta
-        self.optionsData[ticker_id][col_prepend + "price"] = computation.optPrice
+        # target
+        targetOrderId = 0
+        if target > 0 or targetType == "MOC":
+            targetOrder = self.createTargetOrder(
+                -quantity,
+                parentId=entryOrderId,
+                target=target,
+                transmit=False if stop > 0 else True,
+                orderType=targetType,
+                group=group,
+                rth=rth,
+                tif=tif,
+                account=account,
+            )
 
-        # Calculate and save generic/mid values
-        option = self.optionsData[ticker_id]
-        self.optionsData[ticker_id]["imp_vol"] = calc_generic_val(option, "imp_vol")
-        self.optionsData[ticker_id]["dividend"] = calc_generic_val(option, "dividend")
-        self.optionsData[ticker_id]["delta"] = calc_generic_val(option, "delta")
-        self.optionsData[ticker_id]["gamma"] = calc_generic_val(option, "gamma")
-        self.optionsData[ticker_id]["vega"] = calc_generic_val(option, "vega")
-        self.optionsData[ticker_id]["theta"] = calc_generic_val(option, "theta")
-        self.optionsData[ticker_id]["price"] = calc_generic_val(option, "price")
+            targetTrade = self.placeOrder(contract, targetOrder)
+            targetOrderId = targetTrade.order.orderId
+
+        # stop
+        stopOrderId = 0
+        if stop > 0:
+            stop_limit = stopType and stopType.upper() in ["LIMIT", "LMT"]
+
+            stopOrder = self.createStopOrder(
+                -quantity,
+                parentId=entryOrderId,
+                stop=stop,
+                trail=None,
+                transmit=transmit,
+                group=group,
+                rth=rth,
+                tif=tif,
+                stop_limit=stop_limit,
+                account=account,
+            )
+
+            stopTrade = self.placeOrder(contract, stopOrder)
+            stopOrderId = stopTrade.order.orderId
+
+            # triggered trailing stop?
+            if trailingStop and trailingTrigger and trailingValue:
+                trailing_params = {
+                    "symbol": self.contractString(contract),
+                    "quantity": -quantity,
+                    "triggerPrice": trailingTrigger,
+                    "parentId": entryOrderId,
+                    "stopOrderId": stopOrderId,
+                    "targetOrderId": targetOrderId if targetOrderId != 0 else None,
+                    "account": account,
+                }
+                if trailingStop.lower() in ["amt", "amount"]:
+                    trailing_params["trailAmount"] = trailingValue
+                elif trailingStop.lower() in ["pct", "percent"]:
+                    trailing_params["trailPercent"] = trailingValue
+
+                self.createTriggerableTrailingStop(**trailing_params)
+
+        return {
+            "group": group,
+            "entryOrderId": entryOrderId,
+            "targetOrderId": targetOrderId,
+            "stopOrderId": stopOrderId,
+        }
