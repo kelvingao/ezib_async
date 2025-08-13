@@ -278,6 +278,18 @@ class ezIBAsync:
                 self._default_account = self.accountCodes[0]
                 self.ib.client.reqAccountUpdates(True, self._default_account)
 
+            # Check if we already have open orders from startup fetch
+            # If not, request them explicitly
+            await asyncio.sleep(1)  # Give startup fetch time to complete
+            if len(self.ib.openTrades()) == 0:
+                # Only request if no open orders were fetched during startup
+                await self.requestAllOpenOrders()
+            else:
+                self._logger.info(f"Found {len(self.ib.openTrades())} open orders from startup fetch")
+                # Process existing open orders
+                for trade in self.ib.openTrades():
+                    self._onOpenOrderHandler(trade)
+
         except Exception as e:
             self._logger.error(f"Error connecting to IB: {e}")
             self.connected = False
@@ -302,6 +314,12 @@ class ezIBAsync:
             # market / options / depth data handler
             self.ib.pendingTickersEvent += self._onPendingTickersHandler
 
+            # order event handlers
+            self.ib.openOrderEvent += self._onOpenOrderHandler
+            self.ib.orderStatusEvent += self._onOrderStatusHandler
+            self.ib.execDetailsEvent += self._onExecDetailsHandler  # For order fills
+            self.ib.commissionReportEvent += self._onCommissionReportHandler
+            
             # error handler
             self.ib.errorEvent += self._onErrorHandler
 
@@ -1457,6 +1475,108 @@ class ezIBAsync:
         # Return order ID
         return trade
 
+    def cancelOrder(self, order_id):
+        """
+        Cancel order by order ID.
+        
+        Parameters:
+            order_id: Order ID to cancel (int or Trade object)
+            
+        Returns:
+            Trade object if successful, None otherwise
+        """
+        try:
+            # Handle both order ID (int) and Trade object
+            if hasattr(order_id, 'order'):
+                # It's a Trade object, get the order
+                order = order_id.order
+                trade = order_id
+            elif isinstance(order_id, int):
+                # It's an order ID, find the trade
+                trade = None
+                for t in self.ib.trades():
+                    if t.order.orderId == order_id:
+                        trade = t
+                        break
+                
+                if trade is None:
+                    # Create a minimal Order object with just the orderId
+                    from ib_async import Order
+                    order = Order()
+                    order.orderId = order_id
+                else:
+                    order = trade.order
+            else:
+                # Assume it's an Order object
+                order = order_id
+                trade = None
+            
+            # Use ib_async's cancelOrder method
+            result = self.ib.cancelOrder(order)
+            
+            # Update our internal order tracking
+            if order.orderId in self.orders:
+                self.orders[order.orderId]["status"] = "CANCELLED"
+                self.orders[order.orderId]["reason"] = "User cancelled"
+            
+            return result if result else trade
+            
+        except Exception as e:
+            logging.error(f"Error cancelling order {order_id}: {e}")
+            return None
+
+    # ---------------------------------------
+    async def requestOpenOrders(self):
+        """
+        Request open orders from current client ID only.
+        
+        This method retrieves open orders created by the current client ID
+        and populates the orders and symbol_orders dictionaries.
+        """
+        try:
+            self._logger.info("Requesting open orders from current client...")
+            
+            # Use ib_async's reqOpenOrdersAsync method to get open orders
+            open_trades = await self.ib.reqOpenOrdersAsync()
+            
+            self._logger.info(f"Retrieved {len(open_trades)} open orders from current client")
+            
+            # Process each open trade
+            for trade in open_trades:
+                self._onOpenOrderHandler(trade)
+            
+        except Exception as e:
+            self._logger.error(f"Error requesting open orders: {e}")
+    
+    # ---------------------------------------
+    async def requestAllOpenOrders(self):
+        """
+        Request ALL open orders from the account (all client IDs).
+        
+        This method retrieves open orders from all client IDs for the account
+        and populates the orders and symbol_orders dictionaries.
+        """
+        try:
+            self._logger.info("Requesting ALL open orders from account...")
+            
+            # Use ib_async's reqAllOpenOrdersAsync method to get all orders
+            await self.ib.reqAllOpenOrdersAsync()
+            
+            # Wait for the response to be processed
+            await asyncio.sleep(2)
+            
+            # Get the open trades after reqAllOpenOrders
+            all_trades = self.ib.openTrades()
+            
+            self._logger.info(f"Retrieved {len(all_trades)} open orders from all clients")
+            
+            # Process each open trade
+            for trade in all_trades:
+                self._onOpenOrderHandler(trade)
+            
+        except Exception as e:
+            self._logger.error(f"Error requesting all open orders: {e}")
+
     # ---------------------------------------
     async def requestContractDetails(self, contract):
         """
@@ -2192,3 +2312,187 @@ class ezIBAsync:
             "targetOrderId": targetOrderId,
             "stopOrderId": stopOrderId,
         }
+
+    # -----------------------------------------
+    # Order Event Handlers
+    # -----------------------------------------
+    def _onOpenOrderHandler(self, trade):
+        """
+        Handle open order events from IB.
+        
+        Args:
+            trade: Trade object from ib_async containing order and contract info
+        """
+        try:
+            order = trade.order
+            contract = trade.contract
+            order_status = trade.orderStatus
+            
+            # Create contract string for symbol mapping
+            contract_string = self.contractString(contract)
+            
+            # Create unique order key using orderId + clientId to handle duplicate orderIds across clients
+            order_key = f"{order.orderId}_{order.clientId}"
+            
+            # Store order in orders dictionary (by unique order key)
+            self.orders[order_key] = {
+                "id": order.orderId,
+                "clientId": order.clientId,
+                "key": order_key,
+                "symbol": contract_string,
+                "contract": contract,
+                "order": order,
+                "trade": trade,
+                "status": order_status.status if order_status else "Unknown",
+                "reason": getattr(order_status, 'whyHeld', '') if order_status else '',
+                "avgFillPrice": order_status.avgFillPrice if order_status else 0.0,
+                "filled": order_status.filled if order_status else 0.0,
+                "remaining": order_status.remaining if order_status else order.totalQuantity,
+                "parentId": order.parentId if hasattr(order, 'parentId') else 0,
+                "account": getattr(order, 'account', self._default_account),
+            }
+            
+            # Store order in symbol_orders dictionary (by symbol)
+            if contract_string not in self.symbol_orders:
+                self.symbol_orders[contract_string] = {}
+            
+            self.symbol_orders[contract_string][order_key] = self.orders[order_key]
+            
+            # Register contract if not already registered
+            asyncio.create_task(self.registerContract(contract))
+            
+            self._logger.debug(f"Open order updated: {order.orderId} - {contract_string} - {order_status.status if order_status else 'Unknown'}")
+            
+        except Exception as e:
+            self._logger.error(f"Error handling open order: {e}")
+
+    def _onOrderStatusHandler(self, trade):
+        """
+        Handle order status updates from IB.
+        
+        Args:
+            trade: Trade object with updated order status
+        """
+        try:
+            order = trade.order
+            order_status = trade.orderStatus
+            contract = trade.contract
+            
+            contract_string = self.contractString(contract)
+            order_key = f"{order.orderId}_{order.clientId}"
+            
+            # Update order status in both dictionaries
+            if order_key in self.orders:
+                self.orders[order_key].update({
+                    "status": order_status.status,
+                    "reason": getattr(order_status, 'whyHeld', ''),
+                    "avgFillPrice": order_status.avgFillPrice,
+                    "filled": order_status.filled,
+                    "remaining": order_status.remaining,
+                })
+                
+                # Update in symbol_orders as well
+                if contract_string in self.symbol_orders and order_key in self.symbol_orders[contract_string]:
+                    self.symbol_orders[contract_string][order_key].update(self.orders[order_key])
+            
+            # Remove completed orders from active tracking after a delay
+            if order_status.status in ['Filled', 'Cancelled']:
+                # Keep filled/cancelled orders for a short time for reference
+                asyncio.create_task(self._cleanup_completed_order(order_key, contract_string, delay=300))  # 5 minutes
+            
+            self._logger.debug(f"Order status updated: {order.orderId} - {contract_string} - {order_status.status}")
+            
+        except Exception as e:
+            self._logger.error(f"Error handling order status: {e}")
+
+    def _onExecDetailsHandler(self, trade, fill):
+        """
+        Handle execution details (order fills) from IB.
+        
+        Args:
+            trade: Trade object
+            fill: Fill object with execution details
+        """
+        try:
+            order = trade.order
+            execution = fill.execution
+            contract = trade.contract
+            
+            contract_string = self.contractString(contract)
+            order_key = f"{order.orderId}_{order.clientId}"
+            
+            if order_key in self.orders:
+                # Update execution information
+                current_filled = sum(f.execution.shares for f in trade.fills)
+                avg_price = sum(f.execution.price * f.execution.shares for f in trade.fills) / current_filled if current_filled > 0 else 0
+                
+                self.orders[order_key].update({
+                    "filled": current_filled,
+                    "avgFillPrice": avg_price,
+                    "status": "Filled" if current_filled >= order.totalQuantity else "PartiallyFilled",
+                })
+                
+                # Update in symbol_orders as well
+                if contract_string in self.symbol_orders and order_key in self.symbol_orders[contract_string]:
+                    self.symbol_orders[contract_string][order_key].update(self.orders[order_key])
+                
+                self._logger.info(f"Order execution: {order.orderId} - {contract_string} - {execution.shares} shares @ {execution.price:.2f}")
+            
+        except Exception as e:
+            self._logger.error(f"Error handling execution details: {e}")
+
+    def _onCommissionReportHandler(self, trade, fill, commission_report):
+        """
+        Handle commission reports from IB.
+        
+        Args:
+            trade: Trade object
+            fill: Fill object
+            commission_report: CommissionReport object
+        """
+        try:
+            order = trade.order
+            contract = trade.contract
+            contract_string = self.contractString(contract)
+            
+            if order.orderId in self.orders:
+                self.orders[order.orderId]["commission"] = commission_report.commission
+                
+                # Update in symbol_orders as well
+                if contract_string in self.symbol_orders and order.orderId in self.symbol_orders[contract_string]:
+                    self.symbol_orders[contract_string][order.orderId]["commission"] = commission_report.commission
+                
+                self._logger.debug(f"Commission report: {order.orderId} - Commission: {commission_report.commission}")
+            
+        except Exception as e:
+            self._logger.error(f"Error handling commission report: {e}")
+
+    async def _cleanup_completed_order(self, order_id, contract_string, delay=300):
+        """
+        Remove completed orders from tracking after a delay.
+        
+        Args:
+            order_id: Order ID to remove
+            contract_string: Contract string for symbol mapping
+            delay: Delay in seconds before cleanup (default: 5 minutes)
+        """
+        try:
+            await asyncio.sleep(delay)
+            
+            # Remove from orders dictionary
+            if order_id in self.orders:
+                status = self.orders[order_id].get("status", "Unknown")
+                if status in ['Filled', 'Cancelled']:
+                    del self.orders[order_id]
+                    self._logger.debug(f"Cleaned up completed order: {order_id}")
+            
+            # Remove from symbol_orders dictionary
+            if contract_string in self.symbol_orders and order_id in self.symbol_orders[contract_string]:
+                del self.symbol_orders[contract_string][order_id]
+                
+                # Remove symbol entry if no orders remain
+                if not self.symbol_orders[contract_string]:
+                    del self.symbol_orders[contract_string]
+                    
+        except Exception as e:
+            self._logger.error(f"Error cleaning up completed order {order_id}: {e}")
