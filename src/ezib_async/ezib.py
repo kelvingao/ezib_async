@@ -2496,3 +2496,129 @@ class ezIBAsync:
                     
         except Exception as e:
             self._logger.error(f"Error cleaning up completed order {order_id}: {e}")
+
+    async def requestHistoricalData(self, contracts=None, resolution="1 min",
+                                   lookback="1 D", data="TRADES", end_datetime=None, 
+                                   rth=False, csv_path=None, format_date=2):
+        """
+        Request historical data for contracts.
+        
+        Args:
+            contracts: Contract or list of contracts to request data for.
+                      If None, uses all contracts in self.contracts.
+            resolution: Bar size setting. Options:
+                       '1 secs', '5 secs', '10 secs', '15 secs', '30 secs',
+                       '1 min', '2 mins', '3 mins', '5 mins', '10 mins', '15 mins',
+                       '20 mins', '30 mins', '1 hour', '2 hours', '3 hours', '4 hours',
+                       '8 hours', '1 day', '1 week', '1 month'
+            lookback: Duration string. Examples: '60 S', '30 D', '13 W', '6 M', '10 Y'
+            data: What to show. Options: 'TRADES', 'BID', 'ASK', 'BID_ASK', 'MIDPOINT',
+                  'ADJUSTED_LAST', 'HISTORICAL_VOLATILITY', 'OPTION_IMPLIED_VOLATILITY'
+            end_datetime: End date/time for the request. None uses current time.
+            rth: Use regular trading hours only
+            csv_path: Path to save data as CSV (optional)
+            format_date: Date format (1: yyyyMMdd HH:mm:ss, 2: Unix timestamp)
+            
+        Returns:
+            Dict mapping contract strings to list of BarData objects, or 
+            single list if only one contract requested
+        """
+        
+        # Set end datetime to current time if not specified
+        if end_datetime is None:
+            end_datetime = ''
+        
+        # Handle contracts parameter
+        if contracts is None:
+            contracts = list(self.contracts.values())
+        elif not isinstance(contracts, list):
+            contracts = [contracts]
+        
+        results = {}
+        
+        for contract in contracts:
+            # Adjust data type for certain security types
+            show = str(data).upper()
+            if hasattr(contract, 'secType'):
+                if contract.secType in ['CASH', 'FOREX', 'CFD'] and show == 'TRADES':
+                    show = 'MIDPOINT'
+            
+            try:
+                # Request historical data using ib_async
+                bars = await self.ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime=end_datetime,
+                    durationStr=lookback,
+                    barSizeSetting=resolution,
+                    whatToShow=show,
+                    useRTH=bool(rth),
+                    formatDate=int(format_date)
+                )
+                
+                contract_string = self.contractString(contract)
+                results[contract_string] = bars
+                
+                # Save to CSV if path provided
+                if csv_path and bars:
+                    from ib_async import util
+                    import os
+                    import pandas as pd
+                    df = util.df(bars)
+                    if not df.empty:
+                        # Expand user path (handles ~/)
+                        csv_path = os.path.expanduser(csv_path)
+                        
+                        # If csv_path is a directory, create filename
+                        if os.path.isdir(csv_path):
+                            timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+                            filename = os.path.join(csv_path, f"{contract_string.replace(' ', '_')}_{timestamp}.csv")
+                        else:
+                            # Construct filename
+                            if len(contracts) == 1:
+                                filename = csv_path
+                            else:
+                                # Add contract identifier to filename
+                                base, ext = os.path.splitext(csv_path)
+                                filename = f"{base}_{contract_string.replace(' ', '_')}{ext}"
+                        
+                        # Create directory if it doesn't exist
+                        os.makedirs(os.path.dirname(filename) if os.path.dirname(filename) else '.', exist_ok=True)
+                        
+                        df.to_csv(filename, index=True)
+                        self._logger.info(f"Historical data saved to {filename}")
+                
+                self._logger.info(f"Retrieved {len(bars) if bars else 0} historical bars for {contract_string}")
+                
+            except Exception as e:
+                self._logger.error(f"Error requesting historical data for {self.contractString(contract)}: {e}")
+                results[self.contractString(contract)] = None
+        
+        # Return single result if only one contract requested
+        if len(contracts) == 1:
+            return list(results.values())[0]
+        return results
+
+    def cancelHistoricalData(self, contracts=None):
+        """
+        Cancel historical data requests.
+        
+        Note: ib_async handles historical data requests asynchronously,
+        so this method may not be necessary in most cases.
+        
+        Args:
+            contracts: Contract or list of contracts to cancel data for.
+                      If None, cancels for all contracts.
+        """
+        if contracts is None:
+            contracts = list(self.contracts.values())
+        elif not isinstance(contracts, list):
+            contracts = [contracts]
+        
+        for contract in contracts:
+            try:
+                # Note: ib_async doesn't have a direct cancelHistoricalData method
+                # since requests are handled asynchronously and complete immediately
+                contract_string = self.contractString(contract)
+                self._logger.info(f"Historical data request completed for {contract_string}")
+            except Exception as e:
+                self._logger.error(f"Error in cancelHistoricalData for {self.contractString(contract)}: {e}")
