@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Bracket order example for ezib_async.
+Extended Hours Bracket order example for ezib_async.
 
 Demonstrates:
-- Creating bracket orders (entry + profit target + stop loss)
-- Manual bracket order implementation
-- Risk management with stop/target orders
+- Creating bracket orders using ezib's built-in createBracketOrder method
+- Extended hours trading (pre-market and after-hours)
+- Entry order with automatic profit target and stop loss
+- Risk management with OCA (One Cancels All) orders
 
 WARNING: This places real orders! Use paper trading account.
 """
@@ -34,13 +35,14 @@ async def main():
         await ezib.requestMarketData([contract])
         await asyncio.sleep(3)
         
-        current_price = None
-        if contract.symbol in ezib.marketData:
-            data = ezib.marketData[contract.symbol]
-            current_price = data.get('last') or data.get('ask')
-            print(f"Current AAPL price: ${current_price}")
+        # Get current price from market data
+        ticker_id = ezib.tickerId(contract)
+        market_data = ezib.marketData.get(ticker_id, {})
+        current_price = market_data.get('last', [None])[-1] or market_data.get('ask', [None])[-1]
         
-        if not current_price:
+        if current_price:
+            print(f"Current AAPL price: ${current_price}")
+        else:
             print("Could not get current price")
             return
         
@@ -48,55 +50,38 @@ async def main():
         target_price = round(current_price * 1.02, 2)  # +2%
         stop_price = round(current_price * 0.99, 2)    # -1%
         
-        print(f"\nBracket Order Setup:")
+        print(f"\nBracket Order Setup (Extended Hours):")
         print(f"  Entry: Market Order")
         print(f"  Target: ${target_price} (+2%)")
         print(f"  Stop: ${stop_price} (-1%)")
+        print(f"  Extended Hours: Enabled")
         
-        # Check if createBracketOrder exists
-        if hasattr(ezib, 'createBracketOrder'):
-            print("\n=== BRACKET ORDER ===")
-            bracket_order = await ezib.createBracketOrder(
-                contract=contract,
-                quantity=1,
-                entry=0,  # Market order
-                target=target_price,
-                stop=stop_price
-            )
-            print(f"Bracket order created: {bracket_order}")
-            
-        else:
-            print("\n=== MANUAL BRACKET ORDER ===")
-            # Manual implementation: Entry order first
-            entry_order = ezib.createOrder(quantity=1)
-            entry_trade = ezib.placeOrder(contract, entry_order)
-            
-            if entry_trade:
-                print(f"Entry order placed: {entry_trade.order.orderId}")
-                await asyncio.sleep(2)
-                
-                # If filled, place target and stop orders
-                if entry_trade.orderStatus.status == "Filled":
-                    print("Entry filled! Placing target and stop orders...")
-                    
-                    # Target order
-                    target_order = ezib.createOrder(quantity=-1, price=target_price, orderType="LMT")
-                    target_trade = ezib.placeOrder(contract, target_order)
-                    
-                    # Stop order
-                    stop_order = ezib.createOrder(quantity=-1, price=stop_price, orderType="STP", auxPrice=stop_price)
-                    stop_trade = ezib.placeOrder(contract, stop_order)
-                    
-                    print(f"Target order: {target_trade.order.orderId if target_trade else 'Failed'}")
-                    print(f"Stop order: {stop_trade.order.orderId if stop_trade else 'Failed'}")
+        # Use ezib's built-in createBracketOrder method with extended hours
+        print("\n=== BRACKET ORDER (Extended Hours) ===")
+        bracket_result = ezib.createBracketOrder(
+            contract=contract,
+            quantity=1,
+            entry=0,  # Market order
+            target=target_price,
+            stop=stop_price,
+            rth=True  # Enable extended hours trading
+        )
+        print(f"Bracket order created:")
+        print(f"  Entry Order ID: {bracket_result['entryOrderId']}")
+        print(f"  Target Order ID: {bracket_result['targetOrderId']}")
+        print(f"  Stop Order ID: {bracket_result['stopOrderId']}")
+        print(f"  OCA Group: {bracket_result['group']}")
         
-        # Monitor orders
+        # Monitor orders briefly
         await asyncio.sleep(5)
         print(f"\n=== ORDER STATUS ===")
         if ezib.orders:
-            for order_id, order_info in ezib.orders.items():
-                print(f"Order {order_id}: {order_info}")
+            for order_info in ezib.orders.values():
+                print(f"Order {order_info['id']}: {order_info['status']} - {order_info['symbol']}")
+        else:
+            print("No active orders found")
         
+        # Cancel market data subscription
         ezib.cancelMarketData([contract])
         
     except Exception as e:
@@ -111,4 +96,4 @@ async def main():
 if __name__ == "__main__":
     print("WARNING: This example places real bracket orders!")
     print("Uncomment the line below to run:")
-    # asyncio.run(main())
+    asyncio.run(main())
